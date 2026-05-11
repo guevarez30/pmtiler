@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 pub const HEADER_LEN: u64 = 127;
@@ -78,16 +78,48 @@ pub struct ArchiveWriter {
     file: BufWriter<File>,
     entries: Vec<Entry>,
     tile_data_length: u64,
+    tile_data_offset: Option<u64>,
 }
 
 impl ArchiveWriter {
     pub fn create(output: &Path) -> io::Result<Self> {
-        let mut file = BufWriter::new(File::create(output)?);
+        let mut file = BufWriter::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(output)?,
+        );
         file.write_all(&[0_u8; HEADER_LEN as usize])?;
         Ok(Self {
             file,
             entries: Vec::new(),
             tile_data_length: 0,
+            tile_data_offset: None,
+        })
+    }
+
+    pub fn create_with_reserved_directories(
+        output: &Path,
+        reserved_directory_bytes: u64,
+    ) -> io::Result<Self> {
+        let mut file = BufWriter::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(output)?,
+        );
+        file.write_all(&[0_u8; HEADER_LEN as usize])?;
+        let tile_data_offset = HEADER_LEN + reserved_directory_bytes;
+        file.seek(SeekFrom::Start(tile_data_offset))?;
+        Ok(Self {
+            file,
+            entries: Vec::new(),
+            tile_data_length: 0,
+            tile_data_offset: Some(tile_data_offset),
         })
     }
 
@@ -125,6 +157,61 @@ impl ArchiveWriter {
         })
     }
 
+    pub fn finish_reserved_directories(&mut self, metadata: &[u8]) -> io::Result<ArchiveLayout> {
+        let Some(tile_data_offset) = self.tile_data_offset else {
+            return self.finish_directories(metadata);
+        };
+
+        self.entries.sort_by_key(|entry| entry.tile_id);
+        let (root, leaves) = optimize_directories(&self.entries, TARGET_ROOT_LEN);
+
+        let metadata_offset = HEADER_LEN + root.len() as u64;
+        let leaf_directory_offset = metadata_offset + metadata.len() as u64;
+        let directories_end = leaf_directory_offset + leaves.len() as u64;
+        if directories_end > tile_data_offset {
+            return Err(io::Error::other(format!(
+                "reserved PMTiles directory space is too small: need {}, reserved {}",
+                directories_end - HEADER_LEN,
+                tile_data_offset - HEADER_LEN
+            )));
+        }
+
+        self.file.flush()?;
+        self.file.seek(SeekFrom::Start(HEADER_LEN))?;
+        self.file.write_all(&root)?;
+        self.file.write_all(metadata)?;
+        self.file.write_all(&leaves)?;
+        self.file.flush()?;
+
+        let gap = tile_data_offset - directories_end;
+        let tile_data_offset = if gap > 0 && self.tile_data_length <= gap.saturating_mul(4) {
+            compact_file_range(
+                self.file.get_mut(),
+                tile_data_offset,
+                directories_end,
+                self.tile_data_length,
+            )?;
+            self.file
+                .seek(SeekFrom::Start(directories_end + self.tile_data_length))?;
+            directories_end
+        } else {
+            self.file
+                .seek(SeekFrom::Start(tile_data_offset + self.tile_data_length))?;
+            tile_data_offset
+        };
+
+        Ok(ArchiveLayout {
+            root_length: root.len() as u64,
+            metadata_offset,
+            metadata_length: metadata.len() as u64,
+            leaf_directory_offset,
+            leaf_directory_length: leaves.len() as u64,
+            tile_data_offset,
+            tile_data_length: self.tile_data_length,
+            entries_count: self.entries.len() as u64,
+        })
+    }
+
     pub fn write_tile_data(&mut self, data: &[u8]) -> io::Result<()> {
         self.file.write_all(data)
     }
@@ -135,6 +222,30 @@ impl ArchiveWriter {
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&header.serialize())
     }
+}
+
+fn compact_file_range(
+    file: &mut File,
+    source: u64,
+    destination: u64,
+    length: u64,
+) -> io::Result<()> {
+    if source == destination || length == 0 {
+        file.set_len(destination + length)?;
+        return Ok(());
+    }
+
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    while copied < length {
+        let to_copy = buffer.len().min((length - copied) as usize);
+        file.seek(SeekFrom::Start(source + copied))?;
+        file.read_exact(&mut buffer[..to_copy])?;
+        file.seek(SeekFrom::Start(destination + copied))?;
+        file.write_all(&buffer[..to_copy])?;
+        copied += to_copy as u64;
+    }
+    file.set_len(destination + length)
 }
 
 pub struct ArchiveLayout {
