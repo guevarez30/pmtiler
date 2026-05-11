@@ -149,6 +149,8 @@ Raster options:
 --tile-size <px>       Output tile size [default: 512]
 --workers <n>          Native render workers [default: host parallelism]
 --chunk-tiles <n|off>  Chunk width/height in tiles, or disabled/off [default: 8]
+--quality <0-100>      JPEG/WebP quality [default: 100]
+--webp-method <0-6>    WebP speed/size tradeoff, 0 fastest, 6 smallest [default: 4]
 --warp-memory <size>   GDAL warp memory, suffix K/M/G allowed [default: 512M]
 --warp-threads <n|all> GDAL warp compute threads [default: all]
 --resampling <method>  nearest, bilinear, cubic, cubicspline, lanczos, average [default: bilinear]

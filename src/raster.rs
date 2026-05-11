@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::ffi::{CStr, c_int, c_void};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -11,28 +11,113 @@ use std::collections::BTreeMap;
 const WEBMERC_MAX: f64 = 20_037_508.342_789_244;
 const WEBMERC_SIZE: f64 = WEBMERC_MAX * 2.0;
 const DEFAULT_CHUNK_TILES: u32 = 8;
+const DEFAULT_WEBP_QUALITY: f32 = 100.0;
+const DEFAULT_WEBP_METHOD: i32 = 4;
 const MIN_RESERVED_DIRECTORY_BYTES: u64 = 64 * 1024;
 const MAX_RESERVED_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
+const WEBP_ENCODER_ABI_VERSION: c_int = 0x020f;
+
+type WebPWriterFunction = Option<
+    unsafe extern "C" fn(data: *const u8, data_size: usize, picture: *const WebPPicture) -> c_int,
+>;
+
+#[repr(C)]
+struct WebPConfig {
+    lossless: c_int,
+    quality: f32,
+    method: c_int,
+    image_hint: c_int,
+    target_size: c_int,
+    target_psnr: f32,
+    segments: c_int,
+    sns_strength: c_int,
+    filter_strength: c_int,
+    filter_sharpness: c_int,
+    filter_type: c_int,
+    autofilter: c_int,
+    alpha_compression: c_int,
+    alpha_filtering: c_int,
+    alpha_quality: c_int,
+    pass: c_int,
+    show_compressed: c_int,
+    preprocessing: c_int,
+    partitions: c_int,
+    partition_limit: c_int,
+    emulate_jpeg_size: c_int,
+    thread_level: c_int,
+    low_memory: c_int,
+    near_lossless: c_int,
+    exact: c_int,
+    use_delta_palette: c_int,
+    use_sharp_yuv: c_int,
+    qmin: c_int,
+    qmax: c_int,
+}
+
+#[repr(C)]
+struct WebPMemoryWriter {
+    mem: *mut u8,
+    size: usize,
+    max_size: usize,
+    pad: [u32; 1],
+}
+
+#[repr(C)]
+struct WebPPicture {
+    use_argb: c_int,
+    colorspace: c_int,
+    width: c_int,
+    height: c_int,
+    y: *mut u8,
+    u: *mut u8,
+    v: *mut u8,
+    y_stride: c_int,
+    uv_stride: c_int,
+    a: *mut u8,
+    a_stride: c_int,
+    pad1: [u32; 2],
+    argb: *mut u32,
+    argb_stride: c_int,
+    pad2: [u32; 3],
+    writer: WebPWriterFunction,
+    custom_ptr: *mut c_void,
+    extra_info_type: c_int,
+    extra_info: *mut u8,
+    stats: *mut c_void,
+    error_code: c_int,
+    progress_hook:
+        Option<unsafe extern "C" fn(percent: c_int, picture: *const WebPPicture) -> c_int>,
+    user_data: *mut c_void,
+    pad3: [u32; 3],
+    pad4: *mut u8,
+    pad5: *mut u8,
+    pad6: [u32; 8],
+    memory: *mut c_void,
+    memory_argb: *mut c_void,
+    pad7: [*mut c_void; 2],
+}
 
 #[link(name = "webp")]
 unsafe extern "C" {
-    fn WebPEncodeRGB(
-        rgb: *const u8,
-        width: i32,
-        height: i32,
-        stride: i32,
-        quality_factor: f32,
-        output: *mut *mut u8,
-    ) -> usize;
-    fn WebPEncodeRGBA(
+    fn WebPConfigInitInternal(
+        config: *mut WebPConfig,
+        preset: c_int,
+        quality: f32,
+        version: c_int,
+    ) -> c_int;
+    fn WebPValidateConfig(config: *const WebPConfig) -> c_int;
+    fn WebPPictureInitInternal(picture: *mut WebPPicture, version: c_int) -> c_int;
+    fn WebPPictureImportRGB(picture: *mut WebPPicture, rgb: *const u8, rgb_stride: c_int) -> c_int;
+    fn WebPPictureImportRGBA(
+        picture: *mut WebPPicture,
         rgba: *const u8,
-        width: i32,
-        height: i32,
-        stride: i32,
-        quality_factor: f32,
-        output: *mut *mut u8,
-    ) -> usize;
-    fn WebPFree(ptr: *mut std::ffi::c_void);
+        rgba_stride: c_int,
+    ) -> c_int;
+    fn WebPPictureFree(picture: *mut WebPPicture);
+    fn WebPMemoryWriterInit(writer: *mut WebPMemoryWriter);
+    fn WebPMemoryWriterClear(writer: *mut WebPMemoryWriter);
+    fn WebPMemoryWrite(data: *const u8, data_size: usize, picture: *const WebPPicture) -> c_int;
+    fn WebPEncode(config: *const WebPConfig, picture: *mut WebPPicture) -> c_int;
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +135,8 @@ pub struct RasterOptions {
     pub warp_threads: WarpThreads,
     pub resampling: Resampling,
     pub strategy: StrategyPreference,
+    pub webp_quality: f32,
+    pub webp_method: i32,
     pub warp_options: Vec<(String, String)>,
     pub plan_only: bool,
 }
@@ -203,6 +290,8 @@ fn parse_args(args: Vec<String>) -> io::Result<RasterOptions> {
     let mut warp_threads = WarpThreads::All;
     let mut resampling = Resampling::Bilinear;
     let mut strategy = StrategyPreference::Auto;
+    let mut webp_quality = DEFAULT_WEBP_QUALITY;
+    let mut webp_method = DEFAULT_WEBP_METHOD;
     let mut warp_options = Vec::new();
     let mut plan_only = false;
     let mut i = 0;
@@ -284,6 +373,23 @@ fn parse_args(args: Vec<String>) -> io::Result<RasterOptions> {
             arg if arg.starts_with("--strategy=") => {
                 strategy = parse_strategy(&arg["--strategy=".len()..])?;
             }
+            "--quality" | "--webp-quality" => {
+                i += 1;
+                webp_quality = parse_webp_quality(expect_arg(&args, i, "--quality")?)?;
+            }
+            arg if arg.starts_with("--quality=") => {
+                webp_quality = parse_webp_quality(&arg["--quality=".len()..])?;
+            }
+            arg if arg.starts_with("--webp-quality=") => {
+                webp_quality = parse_webp_quality(&arg["--webp-quality=".len()..])?;
+            }
+            "--webp-method" => {
+                i += 1;
+                webp_method = parse_webp_method(expect_arg(&args, i, "--webp-method")?)?;
+            }
+            arg if arg.starts_with("--webp-method=") => {
+                webp_method = parse_webp_method(&arg["--webp-method=".len()..])?;
+            }
             "--warp-option" => {
                 i += 1;
                 warp_options.push(parse_name_value(expect_arg(&args, i, "--warp-option")?)?);
@@ -329,6 +435,8 @@ fn parse_args(args: Vec<String>) -> io::Result<RasterOptions> {
         warp_threads,
         resampling,
         strategy,
+        webp_quality,
+        webp_method,
         warp_options,
         plan_only,
     })
@@ -631,6 +739,26 @@ fn parse_strategy(value: &str) -> io::Result<StrategyPreference> {
     }
 }
 
+fn parse_webp_quality(value: &str) -> io::Result<f32> {
+    let quality = value
+        .parse()
+        .map_err(|_| invalid_input("--quality must be a number from 0 to 100"))?;
+    if !(0.0..=100.0).contains(&quality) {
+        return Err(invalid_input("--quality must be between 0 and 100"));
+    }
+    Ok(quality)
+}
+
+fn parse_webp_method(value: &str) -> io::Result<i32> {
+    let method = value
+        .parse()
+        .map_err(|_| invalid_input("--webp-method must be an integer from 0 to 6"))?;
+    if !(0..=6).contains(&method) {
+        return Err(invalid_input("--webp-method must be between 0 and 6"));
+    }
+    Ok(method)
+}
+
 fn parse_name_value(value: &str) -> io::Result<(String, String)> {
     let Some((name, option_value)) = value.split_once('=') else {
         return Err(invalid_input("--warp-option must be NAME=VALUE"));
@@ -661,6 +789,15 @@ fn print_plan(opts: &RasterOptions, jobs: &[TileJob]) {
     print_field("Warp threads", &opts.warp_threads.label());
     print_field("Resampling", opts.resampling.label());
     print_field("Strategy", opts.strategy.label());
+    if opts.format == RasterFormat::Webp {
+        print_field(
+            "WebP",
+            &format!(
+                "quality {:.1}, method {}",
+                opts.webp_quality, opts.webp_method
+            ),
+        );
+    }
     if !opts.warp_options.is_empty() {
         println!();
         println!("Warp Options");
@@ -711,6 +848,15 @@ fn render_native(opts: &RasterOptions, jobs: &[TileJob]) -> io::Result<()> {
         "Format",
         &format!("{}, {} px", opts.format.as_str(), opts.tile_size),
     );
+    if opts.format == RasterFormat::Webp {
+        status_field(
+            "WebP",
+            &format!(
+                "quality {:.1}, method {}",
+                opts.webp_quality, opts.webp_method
+            ),
+        );
+    }
     status_field("Strategy", strategy.label());
     status_field(
         "Bounds",
@@ -730,30 +876,25 @@ fn render_native(opts: &RasterOptions, jobs: &[TileJob]) -> io::Result<()> {
     let mut completed = 0;
     for zoom_jobs in jobs_by_zoom(jobs) {
         let zoom = zoom_jobs[0].z;
-        let mut rendered_zoom = match opts.chunk_tiles {
-            Some(chunk_tiles) => render_zoom_chunked(&source, opts, zoom_jobs, chunk_tiles)?,
-            None => render_zoom_wide(&source, opts, zoom_jobs)?,
+        let elapsed = match opts.chunk_tiles {
+            Some(chunk_tiles) => {
+                render_zoom_chunked_stream(&source, opts, zoom_jobs, chunk_tiles, &mut writer)?
+            }
+            None => {
+                let mut rendered_zoom = render_zoom_wide(&source, opts, zoom_jobs)?;
+                rendered_zoom.tiles.sort_by_key(|tile| tile.tile_id);
+                for rendered in rendered_zoom.tiles {
+                    write_rendered_tile(&mut writer, &rendered)?;
+                }
+                rendered_zoom.elapsed
+            }
         };
-        rendered_zoom.tiles.sort_by_key(|tile| tile.tile_id);
-
-        for rendered in rendered_zoom.tiles {
-            writer.add_tile(
-                rendered.tile_id,
-                rendered.data.len().try_into().map_err(|_| {
-                    invalid_input(format!(
-                        "encoded tile exceeds PMTiles entry limit: {}",
-                        rendered.tile_id
-                    ))
-                })?,
-            );
-            writer.write_tile_data(&rendered.data)?;
-            completed += 1;
-        }
+        completed += zoom_jobs.len();
         status_field(
             &format!("Zoom z{zoom}"),
             &format!(
                 "done in {:.1}s ({} of {}, {:.0}%)",
-                rendered_zoom.elapsed,
+                elapsed,
                 format_count(completed as u64),
                 format_count(jobs.len() as u64),
                 completed as f64 / jobs.len() as f64 * 100.0
@@ -795,6 +936,22 @@ fn render_native(opts: &RasterOptions, jobs: &[TileJob]) -> io::Result<()> {
     Ok(())
 }
 
+fn write_rendered_tile(
+    writer: &mut pmtiles::ArchiveWriter,
+    rendered: &RenderedTile,
+) -> io::Result<()> {
+    writer.add_tile(
+        rendered.tile_id,
+        rendered.data.len().try_into().map_err(|_| {
+            invalid_input(format!(
+                "encoded tile exceeds PMTiles entry limit: {}",
+                rendered.tile_id
+            ))
+        })?,
+    );
+    writer.write_tile_data(&rendered.data)
+}
+
 fn reserved_directory_bytes(tile_count: usize) -> u64 {
     let estimate = (tile_count as u64).saturating_mul(24);
     estimate.clamp(MIN_RESERVED_DIRECTORY_BYTES, MAX_RESERVED_DIRECTORY_BYTES)
@@ -819,6 +976,7 @@ fn render_zoom_wide(
     })
 }
 
+#[allow(dead_code)]
 fn render_zoom_chunked(
     source: &gdal::Dataset,
     opts: &RasterOptions,
@@ -952,6 +1110,169 @@ fn render_zoom_chunked(
     })
 }
 
+fn render_zoom_chunked_stream(
+    source: &gdal::Dataset,
+    opts: &RasterOptions,
+    zoom_jobs: &[TileJob],
+    chunk_tiles: u32,
+    writer: &mut pmtiles::ArchiveWriter,
+) -> io::Result<f64> {
+    let zoom = zoom_jobs[0].z;
+    let started = std::time::Instant::now();
+    let chunks = chunk_jobs(zoom_jobs, chunk_tiles);
+    let worker_count = opts.workers.max(1).min(chunks.len().max(1));
+    let strategy = select_render_strategy(source, opts)?;
+    let estimated_chunk_mib = estimate_chunk_working_set_mib(opts, zoom_jobs, chunk_tiles);
+    status_field(
+        &format!("Zoom z{zoom}"),
+        &format!(
+            "rendering {} in {} chunks ({} workers, {}, {})",
+            format_tile_count(zoom_jobs.len()),
+            format_count(chunks.len() as u64),
+            worker_count,
+            strategy.label(),
+            format_bytes((estimated_chunk_mib * 1024.0 * 1024.0).round() as u64)
+        ),
+    );
+
+    let mut pending_tiles = BTreeMap::new();
+    let mut next_expected = 0_usize;
+    let mut completed_chunks = 0_usize;
+
+    if worker_count == 1 || chunks.len() <= 1 {
+        let worker_source = gdal::Dataset::open(&opts.input).map_err(gdal_to_io)?;
+        let mut chunk_opts = opts.clone();
+        chunk_opts.workers = 1;
+        for chunk_jobs in &chunks {
+            let chunk_started = std::time::Instant::now();
+            let chunk_dataset = build_tile_dataset(&worker_source, &chunk_opts, chunk_jobs)?;
+            let rendered_chunk =
+                render_chunk_tiles_parallel(&chunk_opts, chunk_dataset, chunk_jobs)?;
+            completed_chunks += 1;
+            status_field(
+                &format!("Zoom z{zoom}"),
+                &format!(
+                    "chunk {}/{} done in {:.1}s ({})",
+                    completed_chunks,
+                    chunks.len(),
+                    chunk_started.elapsed().as_secs_f64(),
+                    format_tile_count(rendered_chunk.len())
+                ),
+            );
+            write_ready_tiles(
+                writer,
+                zoom_jobs,
+                &mut next_expected,
+                &mut pending_tiles,
+                rendered_chunk,
+            )?;
+        }
+    } else {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        let next_index = AtomicUsize::new(0);
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let tx = tx.clone();
+                let next_index = &next_index;
+                let chunks = &chunks;
+                scope.spawn(move || {
+                    let result: Result<(), String> = (|| {
+                        let worker_source =
+                            gdal::Dataset::open(&opts.input).map_err(|err| err.to_string())?;
+                        let mut chunk_opts = opts.clone();
+                        chunk_opts.workers = 1;
+
+                        loop {
+                            let chunk_index = next_index.fetch_add(1, Ordering::Relaxed);
+                            if chunk_index >= chunks.len() {
+                                break;
+                            }
+                            let chunk_jobs = &chunks[chunk_index];
+                            let chunk_started = std::time::Instant::now();
+                            let chunk_dataset =
+                                build_tile_dataset(&worker_source, &chunk_opts, chunk_jobs)
+                                    .map_err(|err| err.to_string())?;
+                            let rendered_chunk =
+                                render_chunk_tiles_parallel(&chunk_opts, chunk_dataset, chunk_jobs)
+                                    .map_err(|err| err.to_string())?;
+                            let elapsed = chunk_started.elapsed().as_secs_f64();
+                            if tx.send(Ok((rendered_chunk, elapsed))).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(err) = result {
+                        let _ = tx.send(Err(err));
+                    }
+                });
+            }
+            drop(tx);
+
+            for result in rx {
+                let (rendered_chunk, elapsed) = result.map_err(io::Error::other)?;
+                completed_chunks += 1;
+                status_field(
+                    &format!("Zoom z{zoom}"),
+                    &format!(
+                        "chunk {}/{} done in {:.1}s ({})",
+                        completed_chunks,
+                        chunks.len(),
+                        elapsed,
+                        format_tile_count(rendered_chunk.len())
+                    ),
+                );
+                write_ready_tiles(
+                    writer,
+                    zoom_jobs,
+                    &mut next_expected,
+                    &mut pending_tiles,
+                    rendered_chunk,
+                )?;
+            }
+
+            Ok::<(), io::Error>(())
+        })?;
+
+        if completed_chunks != chunks.len() {
+            return Err(io::Error::other("not all chunk workers completed"));
+        }
+    }
+
+    if next_expected != zoom_jobs.len() || !pending_tiles.is_empty() {
+        return Err(io::Error::other("not all rendered tiles were written"));
+    }
+
+    Ok(started.elapsed().as_secs_f64())
+}
+
+fn write_ready_tiles(
+    writer: &mut pmtiles::ArchiveWriter,
+    expected_jobs: &[TileJob],
+    next_expected: &mut usize,
+    pending_tiles: &mut BTreeMap<u64, RenderedTile>,
+    rendered_tiles: Vec<RenderedTile>,
+) -> io::Result<()> {
+    for rendered in rendered_tiles {
+        pending_tiles.insert(rendered.tile_id, rendered);
+    }
+
+    while *next_expected < expected_jobs.len() {
+        let tile_id = expected_jobs[*next_expected].tile_id;
+        let Some(rendered) = pending_tiles.remove(&tile_id) else {
+            break;
+        };
+        write_rendered_tile(writer, &rendered)?;
+        *next_expected += 1;
+    }
+
+    Ok(())
+}
+
 fn estimate_chunk_working_set_mib(
     opts: &RasterOptions,
     zoom_jobs: &[TileJob],
@@ -992,9 +1313,10 @@ fn render_chunk_tiles_parallel(
     let worker_count = opts.workers.max(1).min(jobs.len().max(1));
     if worker_count == 1 || jobs.len() <= 1 {
         let mut rendered = Vec::with_capacity(jobs.len());
+        let mut scratch = TileScratch::new(opts.tile_size as usize);
         for job in jobs {
-            let pixels = read_tile_pixels(opts, &chunk_dataset, job)?;
-            let data = encode_tile_gdal(opts, job, pixels)?;
+            let pixels = read_tile_pixels(opts, &chunk_dataset, job, &mut scratch)?;
+            let data = encode_tile_gdal(opts, job, &pixels)?;
             rendered.push(RenderedTile {
                 tile_id: job.tile_id,
                 data,
@@ -1013,6 +1335,7 @@ fn render_chunk_tiles_parallel(
             let chunk_dataset = Arc::clone(&chunk_dataset);
             let next_index = &next_index;
             scope.spawn(move || {
+                let mut scratch = TileScratch::new(opts.tile_size as usize);
                 loop {
                     let index = next_index.fetch_add(1, Ordering::Relaxed);
                     if index >= jobs.len() {
@@ -1024,11 +1347,11 @@ fn render_chunk_tiles_parallel(
                             let chunk_dataset = chunk_dataset
                                 .lock()
                                 .map_err(|_| "chunk dataset lock poisoned".to_owned())?;
-                            read_tile_pixels(opts, &chunk_dataset, &job)
+                            read_tile_pixels(opts, &chunk_dataset, &job, &mut scratch)
                                 .map_err(|err| err.to_string())?
                         };
                         let data =
-                            encode_tile_gdal(opts, &job, pixels).map_err(|err| err.to_string())?;
+                            encode_tile_gdal(opts, &job, &pixels).map_err(|err| err.to_string())?;
                         Ok(RenderedTile {
                             tile_id: job.tile_id,
                             data,
@@ -1657,34 +1980,37 @@ fn last_gdal_error_message() -> String {
     }
 }
 
-fn read_tile_pixels(
+fn read_tile_pixels<'a>(
     opts: &RasterOptions,
     chunk_dataset: &ChunkDataset,
     job: &TileJob,
-) -> io::Result<TilePixels> {
+    scratch: &'a mut TileScratch,
+) -> io::Result<TilePixels<'a>> {
     let tile_size = opts.tile_size as usize;
     match chunk_dataset {
         ChunkDataset::Native(chunk) => {
             let xoff = ((job.x - chunk.min_x) * opts.tile_size) as usize;
             let yoff = ((job.y - chunk.min_y) * opts.tile_size) as usize;
-            let mut pixels = vec![0_u8; tile_size * tile_size * chunk.band_count];
+            scratch
+                .pixels
+                .resize(tile_size * tile_size * chunk.band_count, 0);
             let row_bytes = tile_size * chunk.band_count;
             for y in 0..tile_size {
                 let source_start = ((yoff + y) * chunk.width + xoff) * chunk.band_count;
                 let target_start = y * row_bytes;
-                pixels[target_start..target_start + row_bytes]
+                scratch.pixels[target_start..target_start + row_bytes]
                     .copy_from_slice(&chunk.pixels[source_start..source_start + row_bytes]);
             }
             Ok(TilePixels {
                 tile_size,
                 band_count: chunk.band_count,
-                pixels,
+                pixels: &scratch.pixels,
             })
         }
         ChunkDataset::Gdal(chunk) => {
             let xoff = ((job.x - chunk.min_x) * opts.tile_size) as isize;
             let yoff = ((job.y - chunk.min_y) * opts.tile_size) as isize;
-            let mut bands = Vec::with_capacity(chunk.band_count);
+            scratch.bands.clear();
             for band_index in 1..=chunk.band_count {
                 let source_band = chunk.dataset.rasterband(band_index).map_err(gdal_to_io)?;
                 let data = source_band
@@ -1695,12 +2021,13 @@ fn read_tile_pixels(
                         None,
                     )
                     .map_err(gdal_to_io)?;
-                bands.push(data.data().to_vec());
+                scratch.bands.push(data.data().to_vec());
             }
+            interleave_bands_into(&scratch.bands, tile_size * tile_size, &mut scratch.pixels);
             Ok(TilePixels {
                 tile_size,
                 band_count: chunk.band_count,
-                pixels: interleave_bands(&bands, tile_size * tile_size),
+                pixels: &scratch.pixels,
             })
         }
     }
@@ -1709,13 +2036,13 @@ fn read_tile_pixels(
 fn encode_tile_gdal(
     opts: &RasterOptions,
     job: &TileJob,
-    pixels: TilePixels,
+    pixels: &TilePixels<'_>,
 ) -> io::Result<Vec<u8>> {
     use gdal::DriverManager;
     use gdal::raster::{Buffer, RasterCreationOptions};
 
     if opts.format == RasterFormat::Webp && matches!(pixels.band_count, 3 | 4) {
-        return encode_tile_webp(&pixels);
+        return encode_tile_webp(opts, pixels);
     }
 
     let mem_driver = DriverManager::get_driver_by_name("MEM").map_err(gdal_to_io)?;
@@ -1725,7 +2052,7 @@ fn encode_tile_gdal(
 
     for band_offset in 0..pixels.band_count {
         let band_index = band_offset + 1;
-        let band_data = deinterleave_band(&pixels.pixels, pixels.band_count, band_offset);
+        let band_data = deinterleave_band(pixels.pixels, pixels.band_count, band_offset);
         let mut data = Buffer::new((pixels.tile_size, pixels.tile_size), band_data);
         let mut target_band = tile_ds.rasterband(band_index).map_err(gdal_to_io)?;
         target_band
@@ -1742,7 +2069,7 @@ fn encode_tile_gdal(
     let mut creation_options = RasterCreationOptions::default();
     if matches!(opts.format, RasterFormat::Jpeg | RasterFormat::Webp) {
         creation_options
-            .add_name_value("QUALITY", "85")
+            .add_name_value("QUALITY", &format!("{:.0}", opts.webp_quality))
             .map_err(gdal_to_io)?;
     }
 
@@ -1761,55 +2088,87 @@ fn encode_tile_gdal(
     gdal::vsi::get_vsi_mem_file_bytes_owned(&vsimem_path).map_err(gdal_to_io)
 }
 
-fn encode_tile_webp(pixels: &TilePixels) -> io::Result<Vec<u8>> {
+fn encode_tile_webp(opts: &RasterOptions, pixels: &TilePixels<'_>) -> io::Result<Vec<u8>> {
     let width = i32::try_from(pixels.tile_size)
         .map_err(|_| invalid_input("tile width exceeds libwebp int range"))?;
     let height = i32::try_from(pixels.tile_size)
         .map_err(|_| invalid_input("tile height exceeds libwebp int range"))?;
     let stride = i32::try_from(pixels.tile_size * pixels.band_count)
         .map_err(|_| invalid_input("tile stride exceeds libwebp int range"))?;
-    let mut output = std::ptr::null_mut();
-    let size = unsafe {
+
+    let mut config = std::mem::MaybeUninit::<WebPConfig>::uninit();
+    if unsafe {
+        WebPConfigInitInternal(
+            config.as_mut_ptr(),
+            0,
+            opts.webp_quality,
+            WEBP_ENCODER_ABI_VERSION,
+        )
+    } == 0
+    {
+        return Err(io::Error::other("libwebp config init failed"));
+    }
+    let mut config = unsafe { config.assume_init() };
+    config.method = opts.webp_method;
+    if unsafe { WebPValidateConfig(&config) } == 0 {
+        return Err(invalid_input("invalid libwebp encoder configuration"));
+    }
+
+    let mut picture = std::mem::MaybeUninit::<WebPPicture>::uninit();
+    if unsafe { WebPPictureInitInternal(picture.as_mut_ptr(), WEBP_ENCODER_ABI_VERSION) } == 0 {
+        return Err(io::Error::other("libwebp picture init failed"));
+    }
+    let mut picture = unsafe { picture.assume_init() };
+    picture.width = width;
+    picture.height = height;
+
+    let imported = unsafe {
         if pixels.band_count == 4 {
-            WebPEncodeRGBA(
-                pixels.pixels.as_ptr(),
-                width,
-                height,
-                stride,
-                85.0,
-                &mut output,
-            )
+            WebPPictureImportRGBA(&mut picture, pixels.pixels.as_ptr(), stride)
         } else {
-            WebPEncodeRGB(
-                pixels.pixels.as_ptr(),
-                width,
-                height,
-                stride,
-                85.0,
-                &mut output,
-            )
+            WebPPictureImportRGB(&mut picture, pixels.pixels.as_ptr(), stride)
         }
     };
-    if size == 0 || output.is_null() {
+    if imported == 0 {
+        unsafe {
+            WebPPictureFree(&mut picture);
+        }
+        return Err(io::Error::other("libwebp picture import failed"));
+    }
+
+    let mut writer = std::mem::MaybeUninit::<WebPMemoryWriter>::uninit();
+    unsafe {
+        WebPMemoryWriterInit(writer.as_mut_ptr());
+    }
+    let mut writer = unsafe { writer.assume_init() };
+    picture.writer = Some(WebPMemoryWrite);
+    picture.custom_ptr = (&mut writer as *mut WebPMemoryWriter).cast();
+
+    let encoded_ok = unsafe { WebPEncode(&config, &mut picture) };
+    if encoded_ok == 0 {
+        unsafe {
+            WebPMemoryWriterClear(&mut writer);
+            WebPPictureFree(&mut picture);
+        }
         return Err(io::Error::other("libwebp encode failed"));
     }
 
-    let encoded = unsafe { std::slice::from_raw_parts(output, size).to_vec() };
+    let encoded = unsafe { std::slice::from_raw_parts(writer.mem, writer.size).to_vec() };
     unsafe {
-        WebPFree(output.cast());
+        WebPMemoryWriterClear(&mut writer);
+        WebPPictureFree(&mut picture);
     }
     Ok(encoded)
 }
 
-fn interleave_bands(bands: &[Vec<u8>], pixel_count: usize) -> Vec<u8> {
+fn interleave_bands_into(bands: &[Vec<u8>], pixel_count: usize, pixels: &mut Vec<u8>) {
     let band_count = bands.len();
-    let mut pixels = vec![0_u8; pixel_count * band_count];
+    pixels.resize(pixel_count * band_count, 0);
     for pixel_index in 0..pixel_count {
         for band_offset in 0..band_count {
             pixels[pixel_index * band_count + band_offset] = bands[band_offset][pixel_index];
         }
     }
-    pixels
 }
 
 fn deinterleave_band(pixels: &[u8], band_count: usize, band_offset: usize) -> Vec<u8> {
@@ -1829,10 +2188,24 @@ struct RenderedZoom {
     elapsed: f64,
 }
 
-struct TilePixels {
+struct TileScratch {
+    pixels: Vec<u8>,
+    bands: Vec<Vec<u8>>,
+}
+
+impl TileScratch {
+    fn new(tile_size: usize) -> Self {
+        Self {
+            pixels: Vec::with_capacity(tile_size * tile_size * 4),
+            bands: Vec::new(),
+        }
+    }
+}
+
+struct TilePixels<'a> {
     tile_size: usize,
     band_count: usize,
-    pixels: Vec<u8>,
+    pixels: &'a [u8],
 }
 
 enum ChunkDataset {
@@ -2011,6 +2384,8 @@ Options:
   --tile-size <px>       Output tile size [default: 512]
   --workers <n>          Native render workers [default: host parallelism]
   --chunk-tiles <n|off>  Chunk width/height in tiles, or disabled/off [default: 8]
+  --quality <0-100>      JPEG/WebP quality [default: 100]
+  --webp-method <0-6>    WebP speed/size tradeoff, 0 fastest, 6 smallest [default: 4]
   --warp-memory <size>   GDAL warp memory, suffix K/M/G allowed [default: 512M]
   --warp-threads <n|all> GDAL warp compute threads [default: all]
   --resampling <method>  nearest, bilinear, cubic, cubicspline, lanczos, average [default: bilinear]
