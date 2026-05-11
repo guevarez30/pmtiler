@@ -1,29 +1,54 @@
 # pmtiler
 
+![Rust](https://img.shields.io/badge/Rust-CLI-b7410e?logo=rust&logoColor=white)
+![PMTiles](https://img.shields.io/badge/PMTiles-v3-2f80ed)
+![Raster](https://img.shields.io/badge/Raster-GDAL-4f8f45)
+![Output](https://img.shields.io/badge/Tiles-PNG%20%7C%20JPEG%20%7C%20WebP-6f42c1)
+
 `pmtiler` creates PMTiles archives from raster map tiles and GDAL-readable
 raster sources.
 
-Use it to:
+Use it when you need a small, direct command-line path from local raster data to
+portable PMTiles archives that can be served from object storage, a static file
+host, or a PMTiles server.
 
-- pack an existing XYZ tile directory into a `.pmtiles` file
-- render a GeoTIFF, COG, or VRT mosaic into raster PMTiles
-- inspect PMTiles header, metadata, and archive layout
+## Highlights
+
+- Pack an existing XYZ tile directory into a `.pmtiles` file.
+- Render a GeoTIFF, COG, or VRT mosaic into raster PMTiles.
+- Write PNG, JPEG, or WebP raster tiles.
+- Tune GDAL warp memory, threading, chunking, and resampling.
+- Inspect PMTiles header, metadata, and archive layout.
+
+## Quick Start
+
+```bash
+cargo build --release
+
+target/release/pmtiler raster datasets/blue_marble_demo.tif datasets/blue_marble.pmtiles \
+  --zoom 0-5 \
+  --bounds=-180,-85.05112878,180,85.05112878 \
+  --format webp \
+  --tile-size 512
+
+target/release/pmtiler inspect datasets/blue_marble.pmtiles
+```
 
 ## Requirements
 
-`pmtiler raster` uses GDAL. Install GDAL before building or running raster
-commands.
+`pmtiler raster` uses GDAL and libwebp. Install both before building or running
+raster commands.
 
 Ubuntu/Debian:
 
 ```bash
-sudo apt-get install -y gdal-bin libgdal-dev pkg-config
+sudo apt-get install -y gdal-bin libgdal-dev libwebp-dev pkg-config
 ```
 
 macOS:
 
 ```bash
-brew install gdal
+brew install gdal webp
 ```
 
 Build from source:
@@ -37,6 +62,9 @@ Run the binary:
 ```bash
 target/release/pmtiler --help
 ```
+
+If `pmtiler` is on your `PATH`, the examples below can be run exactly as shown.
+Otherwise, replace `pmtiler` with `target/release/pmtiler`.
 
 ## Commands
 
@@ -116,11 +144,11 @@ Raster options:
 ```text
 --plan                 Print the tile job plan without rendering
 --zoom <z|min-max>     Zoom or zoom range, for example 0-13
---bounds <w,s,e,n>     Lon/lat bounds
+--bounds <w,s,e,n>     Override inferred lon/lat bounds
 --format <fmt>         png, jpeg, jpg, or webp [default: webp]
 --tile-size <px>       Output tile size [default: 512]
 --workers <n>          Native render workers [default: host parallelism]
---chunk-tiles <n>      Experimental chunk width/height in tiles [default: disabled]
+--chunk-tiles <n|off>  Chunk width/height in tiles, or disabled/off [default: 8]
 --warp-memory <size>   GDAL warp memory, suffix K/M/G allowed [default: 512M]
 --warp-threads <n|all> GDAL warp compute threads [default: all]
 --resampling <method>  nearest, bilinear, cubic, cubicspline, lanczos, average [default: bilinear]
@@ -133,13 +161,14 @@ Raster options:
 NaturalVue CONUS COG rendered on the development VM:
 
 ```bash
-pmtiler raster naturalvue-us-conus-3857-webp-q75.tif naturalvue-us-conus-z10.pmtiles \
-  --zoom 0-10 \
+pmtiler raster naturalvue-us-conus-3857-webp-q75.tif naturalvue-us-conus-z0-z11.pmtiles \
+  --zoom 0-11 \
   --bounds=-126.0015,24.9985,-59.9985,50.0015 \
   --format webp \
   --tile-size 512 \
   --workers 8 \
-  --chunk-tiles 16
+  --chunk-tiles 8 \
+  --strategy auto
 ```
 
 Results:
@@ -148,12 +177,14 @@ Results:
 Input GeoTIFF:     15G
 Input CRS:         EPSG:3857
 Input layout:      COG, 512x512 internal tiles, WebP compression, overviews
-Output PMTiles:    1019M
-Zoom range:        0..10
-Tile count:        23,428
-Elapsed time:      407.1 seconds
+Output PMTiles:    4.2G
+Zoom range:        0..11
+Tile count:        92,612
+Elapsed time:      1514.7 seconds
 Output format:     WebP, 512px tiles
 ```
+
+More benchmark details are in [BENCHMARK.md](BENCHMARK.md).
 
 ## Build A VRT From TIFFs
 
@@ -210,6 +241,11 @@ tile contents: 1365
 The output `.pmtiles` file is a single portable archive. Place it in the data
 directory used by a PMTiles server or static file host.
 
+For server setup, follow the PMTiles server guidance in the Protomaps PMTiles
+project: [github.com/protomaps/pmtiles](https://github.com/protomaps/pmtiles).
+Credit to Protomaps for the PMTiles format and server tooling that make this
+deployment path straightforward.
+
 Example:
 
 ```bash
@@ -219,3 +255,9 @@ pmtiler raster mosaic.vrt /srv/pmtiles/conus.pmtiles \
   --format webp \
   --tile-size 512
 ```
+
+## Credits
+
+`pmtiler` writes archives for the PMTiles ecosystem. PMTiles is developed by
+Protomaps; see the upstream project for format details, server usage, and client
+integration examples: <https://github.com/protomaps/pmtiles>.

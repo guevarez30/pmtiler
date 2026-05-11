@@ -1,13 +1,39 @@
 use std::ffi::CStr;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::pmtiles;
+use gdal::GeoTransformEx;
 use gdal::cpl::CslStringList;
+use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
 use std::collections::BTreeMap;
 
 const WEBMERC_MAX: f64 = 20_037_508.342_789_244;
 const WEBMERC_SIZE: f64 = WEBMERC_MAX * 2.0;
+const DEFAULT_CHUNK_TILES: u32 = 8;
+const MIN_RESERVED_DIRECTORY_BYTES: u64 = 64 * 1024;
+const MAX_RESERVED_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
+
+#[link(name = "webp")]
+unsafe extern "C" {
+    fn WebPEncodeRGB(
+        rgb: *const u8,
+        width: i32,
+        height: i32,
+        stride: i32,
+        quality_factor: f32,
+        output: *mut *mut u8,
+    ) -> usize;
+    fn WebPEncodeRGBA(
+        rgba: *const u8,
+        width: i32,
+        height: i32,
+        stride: i32,
+        quality_factor: f32,
+        output: *mut *mut u8,
+    ) -> usize;
+    fn WebPFree(ptr: *mut std::ffi::c_void);
+}
 
 #[derive(Clone, Debug)]
 pub struct RasterOptions {
@@ -85,9 +111,9 @@ enum RenderStrategy {
 impl RenderStrategy {
     fn label(self) -> &'static str {
         match self {
-            Self::SameCrsWebMercator => "same-crs-webmercator",
-            Self::GeographicWgs84 => "geographic-wgs84",
-            Self::GdalWarp => "gdal-warp",
+            Self::SameCrsWebMercator => "Web Mercator fast path",
+            Self::GeographicWgs84 => "EPSG:4326 fast path",
+            Self::GdalWarp => "GDAL warp",
         }
     }
 }
@@ -172,7 +198,7 @@ fn parse_args(args: Vec<String>) -> io::Result<RasterOptions> {
     let mut format = RasterFormat::Webp;
     let mut tile_size = 512;
     let mut workers = available_workers();
-    let mut chunk_tiles = None;
+    let mut chunk_tiles = Some(DEFAULT_CHUNK_TILES);
     let mut warp_memory_bytes = 512.0 * 1024.0 * 1024.0;
     let mut warp_threads = WarpThreads::All;
     let mut resampling = Resampling::Bilinear;
@@ -225,10 +251,10 @@ fn parse_args(args: Vec<String>) -> io::Result<RasterOptions> {
             }
             "--chunk-tiles" => {
                 i += 1;
-                chunk_tiles = Some(parse_chunk_tiles(expect_arg(&args, i, "--chunk-tiles")?)?);
+                chunk_tiles = parse_chunk_tiles(expect_arg(&args, i, "--chunk-tiles")?)?;
             }
             arg if arg.starts_with("--chunk-tiles=") => {
-                chunk_tiles = Some(parse_chunk_tiles(&arg["--chunk-tiles=".len()..])?);
+                chunk_tiles = parse_chunk_tiles(&arg["--chunk-tiles=".len()..])?;
             }
             "--warp-memory" => {
                 i += 1;
@@ -282,15 +308,16 @@ fn parse_args(args: Vec<String>) -> io::Result<RasterOptions> {
     let Some((min_zoom, max_zoom)) = zoom else {
         return Err(invalid_input("raster requires --zoom"));
     };
-    let Some(bounds) = bounds else {
-        return Err(invalid_input(
-            "native raster planning currently requires --bounds until GDAL metadata reads are wired in",
-        ));
+    let input = positional.remove(0);
+    let output = positional.remove(0);
+    let bounds = match bounds {
+        Some(bounds) => bounds,
+        None => infer_raster_bounds(&input)?,
     };
 
     Ok(RasterOptions {
-        input: positional.remove(0),
-        output: positional.remove(0),
+        input,
+        output,
         min_zoom,
         max_zoom,
         bounds,
@@ -387,17 +414,117 @@ fn parse_bounds(value: &str) -> io::Result<[f64; 4]> {
     if parts.len() != 4 {
         return Err(invalid_input("--bounds must be west,south,east,north"));
     }
-    if parts[0] >= parts[2] || parts[1] >= parts[3] {
+    normalize_lonlat_bounds([parts[0], parts[1], parts[2], parts[3]], "--bounds")
+}
+
+fn infer_raster_bounds(path: &Path) -> io::Result<[f64; 4]> {
+    let dataset = gdal::Dataset::open(path).map_err(gdal_to_io)?;
+    let transform = dataset.geo_transform().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "raster has no usable geotransform; pass --bounds west,south,east,north ({err})"
+            ),
+        )
+    })?;
+    let mut source_srs = dataset.spatial_ref().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("raster has no usable CRS; pass --bounds west,south,east,north ({err})"),
+        )
+    })?;
+    source_srs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+
+    let mut target_srs = SpatialRef::from_epsg(4326).map_err(gdal_to_io)?;
+    target_srs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    let coord_transform = CoordTransform::new(&source_srs, &target_srs).map_err(gdal_to_io)?;
+
+    let width = unsafe { gdal_sys::GDALGetRasterXSize(dataset.c_dataset()) } as usize;
+    let height = unsafe { gdal_sys::GDALGetRasterYSize(dataset.c_dataset()) } as usize;
+    if width == 0 || height == 0 {
+        return Err(invalid_input("raster has no pixels"));
+    }
+
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let densify = 21_usize;
+    for i in 0..=densify {
+        let x = width as f64 * i as f64 / densify as f64;
+        push_georef_point(&transform, x, 0.0, &mut xs, &mut ys);
+        push_georef_point(&transform, x, height as f64, &mut xs, &mut ys);
+    }
+    for i in 1..densify {
+        let y = height as f64 * i as f64 / densify as f64;
+        push_georef_point(&transform, 0.0, y, &mut xs, &mut ys);
+        push_georef_point(&transform, width as f64, y, &mut xs, &mut ys);
+    }
+
+    coord_transform
+        .transform_coords(&mut xs, &mut ys, &mut [])
+        .map_err(gdal_to_io)?;
+
+    let mut west = f64::INFINITY;
+    let mut south = f64::INFINITY;
+    let mut east = f64::NEG_INFINITY;
+    let mut north = f64::NEG_INFINITY;
+    for (&lon, &lat) in xs.iter().zip(ys.iter()) {
+        if lon.is_finite() && lat.is_finite() {
+            west = west.min(lon);
+            south = south.min(lat);
+            east = east.max(lon);
+            north = north.max(lat);
+        }
+    }
+
+    if !west.is_finite() || !south.is_finite() || !east.is_finite() || !north.is_finite() {
         return Err(invalid_input(
-            "--bounds must have west < east and south < north",
+            "could not infer finite raster bounds; pass --bounds west,south,east,north",
         ));
     }
-    Ok([
-        parts[0].clamp(-180.0, 180.0),
-        parts[1].clamp(-85.051_128_78, 85.051_128_78),
-        parts[2].clamp(-180.0, 180.0),
-        parts[3].clamp(-85.051_128_78, 85.051_128_78),
-    ])
+
+    let bounds = normalize_lonlat_bounds([west, south, east, north], "inferred bounds")?;
+    status_field(
+        "Bounds inferred",
+        &format!(
+            "{:.7}, {:.7}, {:.7}, {:.7}",
+            bounds[0], bounds[1], bounds[2], bounds[3]
+        ),
+    );
+    Ok(bounds)
+}
+
+fn push_georef_point(
+    transform: &[f64; 6],
+    pixel: f64,
+    line: f64,
+    xs: &mut Vec<f64>,
+    ys: &mut Vec<f64>,
+) {
+    let (x, y) = transform.apply(pixel, line);
+    xs.push(x);
+    ys.push(y);
+}
+
+fn normalize_lonlat_bounds(bounds: [f64; 4], label: &str) -> io::Result<[f64; 4]> {
+    let [west, south, east, north] = bounds;
+    if west >= east || south >= north {
+        return Err(invalid_input(format!(
+            "{label} must have west < east and south < north"
+        )));
+    }
+
+    let clamped = [
+        west.clamp(-180.0, 180.0),
+        south.clamp(-85.051_128_78, 85.051_128_78),
+        east.clamp(-180.0, 180.0),
+        north.clamp(-85.051_128_78, 85.051_128_78),
+    ];
+    if clamped[0] >= clamped[2] || clamped[1] >= clamped[3] {
+        return Err(invalid_input(format!(
+            "{label} do not intersect the Web Mercator tileable extent; pass --bounds west,south,east,north"
+        )));
+    }
+    Ok(clamped)
 }
 
 fn parse_format(value: &str) -> io::Result<RasterFormat> {
@@ -429,14 +556,19 @@ fn parse_workers(value: &str) -> io::Result<usize> {
     Ok(workers)
 }
 
-fn parse_chunk_tiles(value: &str) -> io::Result<u32> {
+fn parse_chunk_tiles(value: &str) -> io::Result<Option<u32>> {
+    if matches!(value, "disabled" | "disable" | "none" | "off") {
+        return Ok(None);
+    }
     let chunk_tiles = value
         .parse()
-        .map_err(|_| invalid_input("--chunk-tiles must be an integer"))?;
+        .map_err(|_| invalid_input("--chunk-tiles must be an integer or disabled"))?;
     if chunk_tiles == 0 {
-        return Err(invalid_input("--chunk-tiles must be greater than zero"));
+        return Err(invalid_input(
+            "--chunk-tiles must be greater than zero or disabled",
+        ));
     }
-    Ok(chunk_tiles)
+    Ok(Some(chunk_tiles))
 }
 
 fn parse_memory_bytes(value: &str) -> io::Result<f64> {
@@ -568,28 +700,43 @@ fn print_plan(opts: &RasterOptions, jobs: &[TileJob]) {
 
 fn render_native(opts: &RasterOptions, jobs: &[TileJob]) -> io::Result<()> {
     use gdal::Dataset;
-    use std::io::{Read, Seek, SeekFrom, Write};
-
     let source = Dataset::open(&opts.input).map_err(gdal_to_io)?;
-    let mut writer = pmtiles::ArchiveWriter::create(&opts.output)?;
-    let temp_path = opts.output.with_extension("pmtiles.tiles.tmp");
-    let mut temp_tiles = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temp_path)?;
+    let strategy = select_render_strategy(&source, opts)?;
+    eprintln!("Rendering");
+    status_field("Input", &opts.input.display().to_string());
+    status_field("Output", &opts.output.display().to_string());
+    status_field("Zooms", &format!("{}..{}", opts.min_zoom, opts.max_zoom));
+    status_field("Tiles", &format_tile_count(jobs.len()));
+    status_field(
+        "Format",
+        &format!("{}, {} px", opts.format.as_str(), opts.tile_size),
+    );
+    status_field("Strategy", strategy.label());
+    status_field(
+        "Bounds",
+        &format!(
+            "{:.7}, {:.7}, {:.7}, {:.7}",
+            opts.bounds[0], opts.bounds[1], opts.bounds[2], opts.bounds[3]
+        ),
+    );
+    eprintln!();
+
+    let mut writer = pmtiles::ArchiveWriter::create_with_reserved_directories(
+        &opts.output,
+        reserved_directory_bytes(jobs.len()),
+    )?;
     let started = std::time::Instant::now();
 
     let mut completed = 0;
     for zoom_jobs in jobs_by_zoom(jobs) {
+        let zoom = zoom_jobs[0].z;
         let mut rendered_zoom = match opts.chunk_tiles {
             Some(chunk_tiles) => render_zoom_chunked(&source, opts, zoom_jobs, chunk_tiles)?,
             None => render_zoom_wide(&source, opts, zoom_jobs)?,
         };
-        rendered_zoom.sort_by_key(|tile| tile.tile_id);
+        rendered_zoom.tiles.sort_by_key(|tile| tile.tile_id);
 
-        for rendered in rendered_zoom {
+        for rendered in rendered_zoom.tiles {
             writer.add_tile(
                 rendered.tile_id,
                 rendered.data.len().try_into().map_err(|_| {
@@ -599,34 +746,23 @@ fn render_native(opts: &RasterOptions, jobs: &[TileJob]) -> io::Result<()> {
                     ))
                 })?,
             );
-            temp_tiles.write_all(&rendered.data)?;
-
+            writer.write_tile_data(&rendered.data)?;
             completed += 1;
-            if completed == jobs.len() || completed % 100 == 0 {
-                eprintln!(
-                    "Progress: {}/{} tiles ({:.0}%) elapsed {:.1}s",
-                    format_count(completed as u64),
-                    format_count(jobs.len() as u64),
-                    completed as f64 / jobs.len() as f64 * 100.0,
-                    started.elapsed().as_secs_f64()
-                );
-            }
         }
+        status_field(
+            &format!("Zoom z{zoom}"),
+            &format!(
+                "done in {:.1}s ({} of {}, {:.0}%)",
+                rendered_zoom.elapsed,
+                format_count(completed as u64),
+                format_count(jobs.len() as u64),
+                completed as f64 / jobs.len() as f64 * 100.0
+            ),
+        );
     }
 
-    temp_tiles.flush()?;
     let metadata = build_metadata(opts);
-    let layout = writer.finish_directories(metadata.as_bytes())?;
-
-    temp_tiles.seek(SeekFrom::Start(0))?;
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = temp_tiles.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        writer.write_tile_data(&buffer[..read])?;
-    }
+    let layout = writer.finish_reserved_directories(metadata.as_bytes())?;
 
     let header = pmtiles::Header {
         root_offset: pmtiles::HEADER_LEN,
@@ -655,31 +791,32 @@ fn render_native(opts: &RasterOptions, jobs: &[TileJob]) -> io::Result<()> {
         center_lat_e7: to_e7((opts.bounds[1] + opts.bounds[3]) / 2.0),
     };
     writer.write_header(&header)?;
-    drop(temp_tiles);
-    let _ = std::fs::remove_file(temp_path);
     print_render_summary(opts, jobs, started.elapsed().as_secs_f64())?;
     Ok(())
+}
+
+fn reserved_directory_bytes(tile_count: usize) -> u64 {
+    let estimate = (tile_count as u64).saturating_mul(24);
+    estimate.clamp(MIN_RESERVED_DIRECTORY_BYTES, MAX_RESERVED_DIRECTORY_BYTES)
 }
 
 fn render_zoom_wide(
     source: &gdal::Dataset,
     opts: &RasterOptions,
     zoom_jobs: &[TileJob],
-) -> io::Result<Vec<RenderedTile>> {
+) -> io::Result<RenderedZoom> {
     let zoom = zoom_jobs[0].z;
     let started = std::time::Instant::now();
-    eprintln!(
-        "Zoom z{zoom}: rendering {} tiles as one warp",
-        format_count(zoom_jobs.len() as u64)
+    status_field(
+        &format!("Zoom z{zoom}"),
+        &format!("rendering {}", format_tile_count(zoom_jobs.len())),
     );
     let dataset = build_tile_dataset(source, opts, zoom_jobs)?;
-    let rendered = render_chunk_tiles_parallel(opts, dataset, zoom_jobs)?;
-    eprintln!(
-        "Zoom z{zoom}: rendered {} tiles in {:.1}s",
-        format_count(rendered.len() as u64),
-        started.elapsed().as_secs_f64()
-    );
-    Ok(rendered)
+    let tiles = render_chunk_tiles_parallel(opts, dataset, zoom_jobs)?;
+    Ok(RenderedZoom {
+        tiles,
+        elapsed: started.elapsed().as_secs_f64(),
+    })
 }
 
 fn render_zoom_chunked(
@@ -687,21 +824,23 @@ fn render_zoom_chunked(
     opts: &RasterOptions,
     zoom_jobs: &[TileJob],
     chunk_tiles: u32,
-) -> io::Result<Vec<RenderedTile>> {
+) -> io::Result<RenderedZoom> {
     let zoom = zoom_jobs[0].z;
+    let started = std::time::Instant::now();
     let chunks = chunk_jobs(zoom_jobs, chunk_tiles);
     let worker_count = opts.workers.max(1).min(chunks.len().max(1));
     let strategy = select_render_strategy(source, opts)?;
     let estimated_chunk_mib = estimate_chunk_working_set_mib(opts, zoom_jobs, chunk_tiles);
-    eprintln!(
-        "Zoom z{zoom}: {} tiles in {} chunks of {}x{}; workers={}; strategy={}; estimated chunk buffers {} per worker",
-        format_count(zoom_jobs.len() as u64),
-        format_count(chunks.len() as u64),
-        chunk_tiles,
-        chunk_tiles,
-        worker_count,
-        strategy.label(),
-        format_bytes((estimated_chunk_mib * 1024.0 * 1024.0).round() as u64)
+    status_field(
+        &format!("Zoom z{zoom}"),
+        &format!(
+            "rendering {} in {} chunks ({} workers, {}, {})",
+            format_tile_count(zoom_jobs.len()),
+            format_count(chunks.len() as u64),
+            worker_count,
+            strategy.label(),
+            format_bytes((estimated_chunk_mib * 1024.0 * 1024.0).round() as u64)
+        ),
     );
 
     if worker_count == 1 || chunks.len() <= 1 {
@@ -714,16 +853,22 @@ fn render_zoom_chunked(
             let chunk_dataset = build_tile_dataset(&worker_source, &chunk_opts, chunk_jobs)?;
             let mut rendered_chunk =
                 render_chunk_tiles_parallel(&chunk_opts, chunk_dataset, chunk_jobs)?;
-            eprintln!(
-                "Zoom z{zoom}: chunk {}/{} rendered {} tiles in {:.1}s",
-                chunk_index + 1,
-                chunks.len(),
-                format_count(rendered_chunk.len() as u64),
-                chunk_started.elapsed().as_secs_f64()
+            status_field(
+                &format!("Zoom z{zoom}"),
+                &format!(
+                    "chunk {}/{} done in {:.1}s ({})",
+                    chunk_index + 1,
+                    chunks.len(),
+                    chunk_started.elapsed().as_secs_f64(),
+                    format_tile_count(rendered_chunk.len())
+                ),
             );
             rendered_zoom.append(&mut rendered_chunk);
         }
-        return Ok(rendered_zoom);
+        return Ok(RenderedZoom {
+            tiles: rendered_zoom,
+            elapsed: started.elapsed().as_secs_f64(),
+        });
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -751,13 +896,6 @@ fn render_zoom_chunked(
                                 break;
                             }
                             let chunk_jobs = &chunks[chunk_index];
-                            eprintln!(
-                                "Zoom z{}: chunk {}/{} started ({} tiles)",
-                                chunk_jobs[0].z,
-                                chunk_index + 1,
-                                chunks.len(),
-                                format_count(chunk_jobs.len() as u64)
-                            );
                             let chunk_started = std::time::Instant::now();
                             let chunk_dataset =
                                 build_tile_dataset(&worker_source, &chunk_opts, chunk_jobs)
@@ -784,14 +922,15 @@ fn render_zoom_chunked(
             for result in rx {
                 let (chunk_index, rendered_chunk, elapsed) = result.map_err(io::Error::other)?;
                 completed_chunks += 1;
-                eprintln!(
-                    "Zoom z{zoom}: chunk {}/{} rendered {} tiles in {:.1}s ({}/{})",
-                    chunk_index + 1,
-                    chunks.len(),
-                    format_count(rendered_chunk.len() as u64),
-                    elapsed,
-                    completed_chunks,
-                    chunks.len()
+                status_field(
+                    &format!("Zoom z{zoom}"),
+                    &format!(
+                        "chunk {}/{} done in {:.1}s ({})",
+                        completed_chunks,
+                        chunks.len(),
+                        elapsed,
+                        format_tile_count(rendered_chunk.len())
+                    ),
                 );
                 rendered_by_chunk[chunk_index] = Some(rendered_chunk);
             }
@@ -807,7 +946,10 @@ fn render_zoom_chunked(
             rendered_chunk.ok_or_else(|| io::Error::other("missing rendered chunk"))?;
         rendered_zoom.append(&mut rendered_chunk);
     }
-    Ok(rendered_zoom)
+    Ok(RenderedZoom {
+        tiles: rendered_zoom,
+        elapsed: started.elapsed().as_secs_f64(),
+    })
 }
 
 fn estimate_chunk_working_set_mib(
@@ -964,12 +1106,12 @@ fn build_tile_dataset(
 
     reproject_with_options(source, &dataset, opts)?;
 
-    Ok(ChunkDataset {
+    Ok(ChunkDataset::Gdal(GdalChunk {
         dataset,
         min_x,
         min_y,
         band_count,
-    })
+    }))
 }
 
 fn select_render_strategy(
@@ -1013,9 +1155,7 @@ fn build_same_crs_webmercator_dataset(
     opts: &RasterOptions,
     jobs: &[TileJob],
 ) -> io::Result<Option<ChunkDataset>> {
-    use gdal::DriverManager;
-    use gdal::raster::{Buffer, GdalDataType};
-    use gdal::spatial_ref::SpatialRef;
+    use gdal::raster::GdalDataType;
 
     if !matches!(opts.resampling, Resampling::Bilinear | Resampling::Nearest) {
         return Ok(None);
@@ -1051,31 +1191,14 @@ fn build_same_crs_webmercator_dataset(
     let width = (max_x - min_x + 1) as usize * opts.tile_size as usize;
     let height = (max_y - min_y + 1) as usize * opts.tile_size as usize;
 
-    let mem_driver = DriverManager::get_driver_by_name("MEM").map_err(gdal_to_io)?;
-    let mut dataset = mem_driver
-        .create_with_band_type::<u8, _>("", width, height, band_count)
-        .map_err(gdal_to_io)?;
-
     let (left, _, _, top) = tile_bounds_mercator(jobs[0].z, min_x, min_y);
     let (_, bottom, right, _) = tile_bounds_mercator(jobs[0].z, max_x, max_y);
-    dataset
-        .set_geo_transform(&[
-            left,
-            (right - left) / width as f64,
-            0.0,
-            top,
-            0.0,
-            -((top - bottom) / height as f64),
-        ])
-        .map_err(gdal_to_io)?;
-    let dst_srs = SpatialRef::from_epsg(3857).map_err(gdal_to_io)?;
-    dataset.set_spatial_ref(&dst_srs).map_err(gdal_to_io)?;
 
     {
         let source_width = unsafe { gdal_sys::GDALGetRasterXSize(source.c_dataset()) } as usize;
         let source_height = unsafe { gdal_sys::GDALGetRasterYSize(source.c_dataset()) } as usize;
         let mut band_map = (1..=band_count as i32).collect::<Vec<_>>();
-        let mut planes = vec![vec![0_u8; width * height]; band_count];
+        let mut pixels = vec![0_u8; width * height * band_count];
 
         let source_left = transform[0];
         let source_top = transform[3];
@@ -1139,31 +1262,26 @@ fn build_same_crs_webmercator_dataset(
                     &mut interleaved,
                 )?;
 
-                for y in 0..dst_height {
-                    for x in 0..dst_width {
-                        let src_offset = (y * dst_width + x) * band_count;
-                        let dst_offset = (dst_yoff + y) * width + dst_xoff + x;
-                        for band_offset in 0..band_count {
-                            planes[band_offset][dst_offset] = interleaved[src_offset + band_offset];
-                        }
-                    }
-                }
+                copy_interleaved_window(
+                    &interleaved,
+                    dst_width,
+                    dst_height,
+                    &mut pixels,
+                    width,
+                    dst_xoff,
+                    dst_yoff,
+                    band_count,
+                );
             }
         }
 
-        for (band_offset, plane) in planes.into_iter().enumerate() {
-            let mut buffer = Buffer::new((width, height), plane);
-            let mut band = dataset.rasterband(band_offset + 1).map_err(gdal_to_io)?;
-            band.write((0, 0), (width, height), &mut buffer)
-                .map_err(gdal_to_io)?;
-        }
-
-        return Ok(Some(ChunkDataset {
-            dataset,
+        return Ok(Some(ChunkDataset::Native(NativeChunk {
+            pixels,
+            width,
             min_x,
             min_y,
             band_count,
-        }));
+        })));
     }
 }
 
@@ -1172,9 +1290,7 @@ fn build_fast_geographic_dataset(
     opts: &RasterOptions,
     jobs: &[TileJob],
 ) -> io::Result<Option<ChunkDataset>> {
-    use gdal::DriverManager;
-    use gdal::raster::{Buffer, GdalDataType};
-    use gdal::spatial_ref::SpatialRef;
+    use gdal::raster::GdalDataType;
 
     if !matches!(opts.resampling, Resampling::Bilinear | Resampling::Nearest) {
         return Ok(None);
@@ -1210,30 +1326,8 @@ fn build_fast_geographic_dataset(
     let width = (max_x - min_x + 1) as usize * opts.tile_size as usize;
     let height = (max_y - min_y + 1) as usize * opts.tile_size as usize;
 
-    let mem_driver = DriverManager::get_driver_by_name("MEM").map_err(gdal_to_io)?;
-    let mut dataset = mem_driver
-        .create_with_band_type::<u8, _>("", width, height, band_count)
-        .map_err(gdal_to_io)?;
-
     let (left, _, _, top) = tile_bounds_mercator(jobs[0].z, min_x, min_y);
     let (_, bottom, right, _) = tile_bounds_mercator(jobs[0].z, max_x, max_y);
-    dataset
-        .set_geo_transform(&[
-            left,
-            (right - left) / width as f64,
-            0.0,
-            top,
-            0.0,
-            -((top - bottom) / height as f64),
-        ])
-        .map_err(gdal_to_io)?;
-    let dst_srs = SpatialRef::from_epsg(3857).map_err(gdal_to_io)?;
-    dataset.set_spatial_ref(&dst_srs).map_err(gdal_to_io)?;
-
-    eprintln!(
-        "Zoom z{}: using exact EPSG:4326 -> WebMercator fast path",
-        jobs[0].z
-    );
 
     let source_width = unsafe { gdal_sys::GDALGetRasterXSize(source.c_dataset()) } as usize;
     let source_height = unsafe { gdal_sys::GDALGetRasterYSize(source.c_dataset()) } as usize;
@@ -1246,7 +1340,7 @@ fn build_fast_geographic_dataset(
         x_samples.push(sample_indices(src_x, source_width, opts.resampling));
     }
 
-    let mut planes = vec![vec![0_u8; width * height]; band_count];
+    let mut pixels = vec![0_u8; width * height * band_count];
     let row_len = source_width * band_count;
     let mut row_a = vec![0_u8; row_len];
     let mut row_b = vec![0_u8; row_len];
@@ -1287,33 +1381,47 @@ fn build_fast_geographic_dataset(
         }
 
         for (x, x_sample) in x_samples.iter().enumerate() {
-            let out_offset = y * width + x;
-            for (band_offset, plane) in planes.iter_mut().enumerate() {
+            let out_offset = (y * width + x) * band_count;
+            for band_offset in 0..band_count {
                 let top_left = row_a[x_sample.lower * band_count + band_offset] as f64;
                 let top_right = row_a[x_sample.upper * band_count + band_offset] as f64;
                 let bottom_left = row_b[x_sample.lower * band_count + band_offset] as f64;
                 let bottom_right = row_b[x_sample.upper * band_count + band_offset] as f64;
                 let top_value = top_left + (top_right - top_left) * x_sample.weight;
                 let bottom_value = bottom_left + (bottom_right - bottom_left) * x_sample.weight;
-                plane[out_offset] =
+                pixels[out_offset + band_offset] =
                     (top_value + (bottom_value - top_value) * y_sample.weight).round() as u8;
             }
         }
     }
 
-    for (band_offset, plane) in planes.into_iter().enumerate() {
-        let mut buffer = Buffer::new((width, height), plane);
-        let mut band = dataset.rasterband(band_offset + 1).map_err(gdal_to_io)?;
-        band.write((0, 0), (width, height), &mut buffer)
-            .map_err(gdal_to_io)?;
-    }
-
-    Ok(Some(ChunkDataset {
-        dataset,
+    Ok(Some(ChunkDataset::Native(NativeChunk {
+        pixels,
+        width,
         min_x,
         min_y,
         band_count,
-    }))
+    })))
+}
+
+fn copy_interleaved_window(
+    source: &[u8],
+    source_width: usize,
+    source_height: usize,
+    destination: &mut [u8],
+    destination_width: usize,
+    destination_x: usize,
+    destination_y: usize,
+    band_count: usize,
+) {
+    let row_bytes = source_width * band_count;
+    for y in 0..source_height {
+        let source_start = y * row_bytes;
+        let destination_start =
+            ((destination_y + y) * destination_width + destination_x) * band_count;
+        destination[destination_start..destination_start + row_bytes]
+            .copy_from_slice(&source[source_start..source_start + row_bytes]);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1555,29 +1663,47 @@ fn read_tile_pixels(
     job: &TileJob,
 ) -> io::Result<TilePixels> {
     let tile_size = opts.tile_size as usize;
-    let xoff = ((job.x - chunk_dataset.min_x) * opts.tile_size) as isize;
-    let yoff = ((job.y - chunk_dataset.min_y) * opts.tile_size) as isize;
-    let mut bands = Vec::with_capacity(chunk_dataset.band_count);
-    for band_index in 1..=chunk_dataset.band_count {
-        let source_band = chunk_dataset
-            .dataset
-            .rasterband(band_index)
-            .map_err(gdal_to_io)?;
-        let data = source_band
-            .read_as::<u8>(
-                (xoff, yoff),
-                (tile_size, tile_size),
-                (tile_size, tile_size),
-                None,
-            )
-            .map_err(gdal_to_io)?;
-        bands.push(data.data().to_vec());
+    match chunk_dataset {
+        ChunkDataset::Native(chunk) => {
+            let xoff = ((job.x - chunk.min_x) * opts.tile_size) as usize;
+            let yoff = ((job.y - chunk.min_y) * opts.tile_size) as usize;
+            let mut pixels = vec![0_u8; tile_size * tile_size * chunk.band_count];
+            let row_bytes = tile_size * chunk.band_count;
+            for y in 0..tile_size {
+                let source_start = ((yoff + y) * chunk.width + xoff) * chunk.band_count;
+                let target_start = y * row_bytes;
+                pixels[target_start..target_start + row_bytes]
+                    .copy_from_slice(&chunk.pixels[source_start..source_start + row_bytes]);
+            }
+            Ok(TilePixels {
+                tile_size,
+                band_count: chunk.band_count,
+                pixels,
+            })
+        }
+        ChunkDataset::Gdal(chunk) => {
+            let xoff = ((job.x - chunk.min_x) * opts.tile_size) as isize;
+            let yoff = ((job.y - chunk.min_y) * opts.tile_size) as isize;
+            let mut bands = Vec::with_capacity(chunk.band_count);
+            for band_index in 1..=chunk.band_count {
+                let source_band = chunk.dataset.rasterband(band_index).map_err(gdal_to_io)?;
+                let data = source_band
+                    .read_as::<u8>(
+                        (xoff, yoff),
+                        (tile_size, tile_size),
+                        (tile_size, tile_size),
+                        None,
+                    )
+                    .map_err(gdal_to_io)?;
+                bands.push(data.data().to_vec());
+            }
+            Ok(TilePixels {
+                tile_size,
+                band_count: chunk.band_count,
+                pixels: interleave_bands(&bands, tile_size * tile_size),
+            })
+        }
     }
-    Ok(TilePixels {
-        tile_size,
-        band_count: chunk_dataset.band_count,
-        bands,
-    })
 }
 
 fn encode_tile_gdal(
@@ -1588,13 +1714,18 @@ fn encode_tile_gdal(
     use gdal::DriverManager;
     use gdal::raster::{Buffer, RasterCreationOptions};
 
+    if opts.format == RasterFormat::Webp && matches!(pixels.band_count, 3 | 4) {
+        return encode_tile_webp(&pixels);
+    }
+
     let mem_driver = DriverManager::get_driver_by_name("MEM").map_err(gdal_to_io)?;
     let tile_ds = mem_driver
         .create_with_band_type::<u8, _>("", pixels.tile_size, pixels.tile_size, pixels.band_count)
         .map_err(gdal_to_io)?;
 
-    for (band_offset, band_data) in pixels.bands.into_iter().enumerate() {
+    for band_offset in 0..pixels.band_count {
         let band_index = band_offset + 1;
+        let band_data = deinterleave_band(&pixels.pixels, pixels.band_count, band_offset);
         let mut data = Buffer::new((pixels.tile_size, pixels.tile_size), band_data);
         let mut target_band = tile_ds.rasterband(band_index).map_err(gdal_to_io)?;
         target_band
@@ -1630,18 +1761,94 @@ fn encode_tile_gdal(
     gdal::vsi::get_vsi_mem_file_bytes_owned(&vsimem_path).map_err(gdal_to_io)
 }
 
+fn encode_tile_webp(pixels: &TilePixels) -> io::Result<Vec<u8>> {
+    let width = i32::try_from(pixels.tile_size)
+        .map_err(|_| invalid_input("tile width exceeds libwebp int range"))?;
+    let height = i32::try_from(pixels.tile_size)
+        .map_err(|_| invalid_input("tile height exceeds libwebp int range"))?;
+    let stride = i32::try_from(pixels.tile_size * pixels.band_count)
+        .map_err(|_| invalid_input("tile stride exceeds libwebp int range"))?;
+    let mut output = std::ptr::null_mut();
+    let size = unsafe {
+        if pixels.band_count == 4 {
+            WebPEncodeRGBA(
+                pixels.pixels.as_ptr(),
+                width,
+                height,
+                stride,
+                85.0,
+                &mut output,
+            )
+        } else {
+            WebPEncodeRGB(
+                pixels.pixels.as_ptr(),
+                width,
+                height,
+                stride,
+                85.0,
+                &mut output,
+            )
+        }
+    };
+    if size == 0 || output.is_null() {
+        return Err(io::Error::other("libwebp encode failed"));
+    }
+
+    let encoded = unsafe { std::slice::from_raw_parts(output, size).to_vec() };
+    unsafe {
+        WebPFree(output.cast());
+    }
+    Ok(encoded)
+}
+
+fn interleave_bands(bands: &[Vec<u8>], pixel_count: usize) -> Vec<u8> {
+    let band_count = bands.len();
+    let mut pixels = vec![0_u8; pixel_count * band_count];
+    for pixel_index in 0..pixel_count {
+        for band_offset in 0..band_count {
+            pixels[pixel_index * band_count + band_offset] = bands[band_offset][pixel_index];
+        }
+    }
+    pixels
+}
+
+fn deinterleave_band(pixels: &[u8], band_count: usize, band_offset: usize) -> Vec<u8> {
+    pixels
+        .chunks_exact(band_count)
+        .map(|pixel| pixel[band_offset])
+        .collect()
+}
+
 struct RenderedTile {
     tile_id: u64,
     data: Vec<u8>,
 }
 
+struct RenderedZoom {
+    tiles: Vec<RenderedTile>,
+    elapsed: f64,
+}
+
 struct TilePixels {
     tile_size: usize,
     band_count: usize,
-    bands: Vec<Vec<u8>>,
+    pixels: Vec<u8>,
 }
 
-struct ChunkDataset {
+enum ChunkDataset {
+    Native(NativeChunk),
+    Gdal(GdalChunk),
+}
+
+struct NativeChunk {
+    pixels: Vec<u8>,
+    width: usize,
+    min_x: u32,
+    min_y: u32,
+    band_count: usize,
+}
+
+struct GdalChunk {
     dataset: gdal::Dataset,
     min_x: u32,
     min_y: u32,
@@ -1744,6 +1951,15 @@ fn print_field(label: &str, value: &str) {
     println!("  {label:<20} {value}");
 }
 
+fn status_field(label: &str, value: &str) {
+    eprintln!("  {label:<18} {value}");
+}
+
+fn format_tile_count(count: usize) -> String {
+    let suffix = if count == 1 { "tile" } else { "tiles" };
+    format!("{} {suffix}", format_count(count as u64))
+}
+
 fn format_count(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -1783,18 +1999,18 @@ pmtiler raster
 Render a GDAL-readable raster source into a PMTiles archive.
 
 Usage:
-  pmtiler raster <RASTER_OR_VRT> <OUTPUT.pmtiles> --zoom MIN-MAX --bounds W,S,E,N [OPTIONS]
+  pmtiler raster <RASTER_OR_VRT> <OUTPUT.pmtiles> --zoom MIN-MAX [OPTIONS]
 
 Required:
   --zoom <z|min-max>     Zoom or zoom range, for example 0-13
-  --bounds <w,s,e,n>     Lon/lat bounds
 
 Options:
   --plan                 Print the tile job plan without rendering
+  --bounds <w,s,e,n>     Override inferred lon/lat bounds
   --format <fmt>         png, jpeg, jpg, or webp [default: webp]
   --tile-size <px>       Output tile size [default: 512]
   --workers <n>          Native render workers [default: host parallelism]
-  --chunk-tiles <n>      Experimental chunk width/height in tiles [default: disabled]
+  --chunk-tiles <n|off>  Chunk width/height in tiles, or disabled/off [default: 8]
   --warp-memory <size>   GDAL warp memory, suffix K/M/G allowed [default: 512M]
   --warp-threads <n|all> GDAL warp compute threads [default: all]
   --resampling <method>  nearest, bilinear, cubic, cubicspline, lanczos, average [default: bilinear]

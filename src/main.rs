@@ -97,7 +97,26 @@ fn run() -> io::Result<()> {
             inspect_pmtiles(&archive)
         }
         "raster" => raster::run(args.collect()),
-        "-h" | "--help" | "help" => {
+        "help" => match args.next().as_deref() {
+            Some("pack") => {
+                print_pack_help();
+                Ok(())
+            }
+            Some("raster") => {
+                raster::print_raster_help();
+                Ok(())
+            }
+            Some("inspect") => {
+                print_inspect_help();
+                Ok(())
+            }
+            Some(command) => Err(invalid_input(format!("unknown command `{command}`"))),
+            None => {
+                print_help();
+                Ok(())
+            }
+        },
+        "-h" | "--help" => {
             print_help();
             Ok(())
         }
@@ -121,14 +140,28 @@ Commands:
   inspect   Show PMTiles header and metadata
   help      Show this help
 
-Pack:
+Command help:
+  pmtiler help pack
+  pmtiler help raster
+  pmtiler help inspect
+
+Examples:
   pmtiler pack [OPTIONS] <TILE_DIR> <OUTPUT.pmtiles>
-
-Raster:
-  pmtiler raster <RASTER_OR_VRT> <OUTPUT.pmtiles> --zoom MIN-MAX --bounds W,S,E,N [OPTIONS]
-
-Inspect:
+  pmtiler raster <RASTER_OR_VRT> <OUTPUT.pmtiles> --zoom MIN-MAX [OPTIONS]
   pmtiler inspect <ARCHIVE.pmtiles>
+"
+    );
+}
+
+fn print_pack_help() {
+    println!(
+        "\
+pmtiler pack
+
+Pack an XYZ raster tile directory into a PMTiles v3 archive.
+
+Usage:
+  pmtiler pack [OPTIONS] <TILE_DIR> <OUTPUT.pmtiles>
 
 XYZ tile layout:
   <TILE_DIR>/<z>/<x>/<y>.webp
@@ -145,7 +178,27 @@ Pack options:
     );
 }
 
+fn print_inspect_help() {
+    println!(
+        "\
+pmtiler inspect
+
+Show PMTiles header, bounds, sections, and metadata.
+
+Usage:
+  pmtiler inspect <ARCHIVE.pmtiles>
+
+Options:
+  -h, --help             Show help
+"
+    );
+}
+
 fn parse_inspect_args(args: Vec<String>) -> io::Result<PathBuf> {
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
+        print_inspect_help();
+        std::process::exit(0);
+    }
     if args.len() != 1 {
         return Err(invalid_input("inspect requires <ARCHIVE.pmtiles>"));
     }
@@ -163,7 +216,7 @@ fn parse_pack_args(args: Vec<String>) -> io::Result<PackOptions> {
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
-                print_help();
+                print_pack_help();
                 std::process::exit(0);
             }
             "--name" => {
