@@ -19,7 +19,7 @@ target/release/pmtiler raster datasets/blue_marble_demo.tif /tmp/blue-marble-ben
 ```
 
 Results after native chunk buffers, direct libwebp encoding, direct archive
-streaming, and default `--chunk-tiles 8`:
+streaming, and default chunked rendering:
 
 ```text
 Tiles:              5,461
@@ -117,6 +117,57 @@ rendering takes a long time.
 
 ## NaturalVue CONUS z0-11
 
+Current comparable WebP q75 run after adaptive chunking, native tile views, and
+direct libwebp encoding:
+
+```bash
+target/release/pmtiler raster \
+  /home/raftdev/maps/datasets/naturalvue-us/naturalvue-us-conus-3857-webp-q75.tif \
+  /tmp/pmtiler-naturalvue-z0-z11-q75.pmtiles \
+  --zoom 0-11 \
+  --bounds=-126.0015,24.9985,-59.9985,50.0015 \
+  --format webp \
+  --tile-size 512 \
+  --workers 8 \
+  --chunk-tiles auto \
+  --strategy auto \
+  --quality 75 \
+  --webp-method 4
+```
+
+Results:
+
+```text
+Tiles:              92,612
+Elapsed:            1082.7 seconds (18m 02.7s)
+Throughput:         85.5 tiles/s
+Output PMTiles:     2.9 GiB tile data / 2.9G file
+Zoom range:         0..11
+Strategy:           same-crs-webmercator
+Workers:            8
+Chunk size:         adaptive (z0-z7: 4x4, z8-z11: 8x8)
+z9 elapsed:         51.0 seconds
+z10 elapsed:        202.5 seconds
+z11 elapsed:        805.2 seconds
+```
+
+Inspect summary:
+
+```text
+version:            3
+tile type:          webp
+zoom:               0..11
+addressed tiles:    92,612
+tile entries:       92,612
+tile contents:      92,612
+tile data:          2.9 GiB
+root:               168 B @ 127 B
+metadata:           346 B @ 295 B
+leaves:             512.0 KiB @ 641 B
+```
+
+Historical full-range run:
+
 Command:
 
 ```bash
@@ -165,4 +216,6 @@ leaves:             513.0 KiB @ 638 B
 The raster path now streams encoded tile bytes into the final archive while
 reserving directory space up front. The same-CRS and EPSG:4326 fast paths keep
 chunk pixels in native interleaved buffers, then encode WebP through libwebp
-instead of creating one GDAL MEM dataset and `/vsimem` file per tile.
+instead of creating one GDAL MEM dataset and `/vsimem` file per tile. Current
+builds default to adaptive chunking; pass `--chunk-tiles <n>` to reproduce a
+fixed historical chunk size.
