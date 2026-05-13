@@ -3,16 +3,19 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::pmtiles;
-use gdal::GeoTransformEx;
+use gdal::config::set_config_option;
 use gdal::cpl::CslStringList;
 use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
+use gdal::{DatasetOptions, GdalOpenFlags, GeoTransformEx};
 use std::collections::BTreeMap;
 
 const WEBMERC_MAX: f64 = 20_037_508.342_789_244;
 const WEBMERC_SIZE: f64 = WEBMERC_MAX * 2.0;
-const DEFAULT_CHUNK_TILES: u32 = 8;
+const DEFAULT_AUTO_CHUNK_TARGETS_PER_WORKER: usize = 8;
 const DEFAULT_WEBP_QUALITY: f32 = 100.0;
 const DEFAULT_WEBP_METHOD: i32 = 4;
+const AUTO_CHUNK_MAX_BYTES: usize = 256 * 1024 * 1024;
+const AUTO_CHUNK_MIN_BYTES: usize = 32 * 1024 * 1024;
 const MIN_RESERVED_DIRECTORY_BYTES: u64 = 64 * 1024;
 const MAX_RESERVED_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
 const WEBP_ENCODER_ABI_VERSION: c_int = 0x020f;
@@ -130,13 +133,14 @@ pub struct RasterOptions {
     pub format: RasterFormat,
     pub tile_size: u32,
     pub workers: usize,
-    pub chunk_tiles: Option<u32>,
+    pub chunk_tiles: ChunkTiles,
     pub warp_memory_bytes: f64,
     pub warp_threads: WarpThreads,
     pub resampling: Resampling,
     pub strategy: StrategyPreference,
     pub webp_quality: f32,
     pub webp_method: i32,
+    pub gdal_tuning: GdalTuning,
     pub warp_options: Vec<(String, String)>,
     pub plan_only: bool,
 }
@@ -150,13 +154,23 @@ pub enum RasterFormat {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WarpThreads {
+    Auto,
     All,
     Count(usize),
 }
 
 impl WarpThreads {
-    fn as_gdal_value(self) -> String {
+    fn as_gdal_value(self, concurrent_warps: usize) -> String {
         match self {
+            Self::Auto => {
+                if concurrent_warps <= 1 {
+                    "ALL_CPUS".to_owned()
+                } else {
+                    (available_workers() / concurrent_warps.max(1))
+                        .max(1)
+                        .to_string()
+                }
+            }
             Self::All => "ALL_CPUS".to_owned(),
             Self::Count(count) => count.to_string(),
         }
@@ -164,10 +178,35 @@ impl WarpThreads {
 
     fn label(self) -> String {
         match self {
+            Self::Auto => "auto".to_owned(),
             Self::All => "all".to_owned(),
             Self::Count(count) => count.to_string(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChunkTiles {
+    Auto,
+    Fixed(u32),
+    Disabled,
+}
+
+impl ChunkTiles {
+    fn label(self) -> String {
+        match self {
+            Self::Auto => "auto".to_owned(),
+            Self::Fixed(chunk_tiles) => chunk_tiles.to_string(),
+            Self::Disabled => "disabled".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GdalTuning {
+    pub cache_bytes: Option<u64>,
+    pub config_options: Vec<(String, String)>,
+    pub open_options: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,10 +310,9 @@ pub fn run(args: Vec<String>) -> io::Result<()> {
     let jobs = enumerate_tile_jobs(opts.bounds, opts.min_zoom, opts.max_zoom)?;
 
     if opts.plan_only {
-        print_plan(&opts, &jobs);
+        print_plan(&opts, &jobs)?;
         return Ok(());
     }
-
     render_native(&opts, &jobs)
 }
 
@@ -285,13 +323,14 @@ fn parse_args(args: Vec<String>) -> io::Result<RasterOptions> {
     let mut format = RasterFormat::Webp;
     let mut tile_size = 512;
     let mut workers = available_workers();
-    let mut chunk_tiles = Some(DEFAULT_CHUNK_TILES);
+    let mut chunk_tiles = ChunkTiles::Auto;
     let mut warp_memory_bytes = 512.0 * 1024.0 * 1024.0;
-    let mut warp_threads = WarpThreads::All;
+    let mut warp_threads = WarpThreads::Auto;
     let mut resampling = Resampling::Bilinear;
     let mut strategy = StrategyPreference::Auto;
     let mut webp_quality = DEFAULT_WEBP_QUALITY;
     let mut webp_method = DEFAULT_WEBP_METHOD;
+    let mut gdal_tuning = GdalTuning::default();
     let mut warp_options = Vec::new();
     let mut plan_only = false;
     let mut i = 0;
@@ -397,6 +436,55 @@ fn parse_args(args: Vec<String>) -> io::Result<RasterOptions> {
             arg if arg.starts_with("--warp-option=") => {
                 warp_options.push(parse_name_value(&arg["--warp-option=".len()..])?);
             }
+            "--gdal-cache" => {
+                i += 1;
+                gdal_tuning.cache_bytes =
+                    Some(parse_memory_bytes(expect_arg(&args, i, "--gdal-cache")?)?.round() as u64);
+            }
+            arg if arg.starts_with("--gdal-cache=") => {
+                gdal_tuning.cache_bytes =
+                    Some(parse_memory_bytes(&arg["--gdal-cache=".len()..])?.round() as u64);
+            }
+            "--gdal-config" => {
+                i += 1;
+                gdal_tuning.config_options.push(parse_name_value(expect_arg(
+                    &args,
+                    i,
+                    "--gdal-config",
+                )?)?);
+            }
+            arg if arg.starts_with("--gdal-config=") => {
+                gdal_tuning
+                    .config_options
+                    .push(parse_name_value(&arg["--gdal-config=".len()..])?);
+            }
+            "--open-option" => {
+                i += 1;
+                gdal_tuning.open_options.push(parse_name_value(expect_arg(
+                    &args,
+                    i,
+                    "--open-option",
+                )?)?);
+            }
+            arg if arg.starts_with("--open-option=") => {
+                gdal_tuning
+                    .open_options
+                    .push(parse_name_value(&arg["--open-option=".len()..])?);
+            }
+            "--gdal-disable-readdir" => {
+                i += 1;
+                let value =
+                    parse_gdal_disable_readdir(expect_arg(&args, i, "--gdal-disable-readdir")?)?;
+                gdal_tuning
+                    .config_options
+                    .push(("GDAL_DISABLE_READDIR_ON_OPEN".to_owned(), value));
+            }
+            arg if arg.starts_with("--gdal-disable-readdir=") => {
+                let value = parse_gdal_disable_readdir(&arg["--gdal-disable-readdir=".len()..])?;
+                gdal_tuning
+                    .config_options
+                    .push(("GDAL_DISABLE_READDIR_ON_OPEN".to_owned(), value));
+            }
             arg if arg.starts_with('-') => {
                 return Err(invalid_input(format!("unknown raster option `{arg}`")));
             }
@@ -416,9 +504,10 @@ fn parse_args(args: Vec<String>) -> io::Result<RasterOptions> {
     };
     let input = positional.remove(0);
     let output = positional.remove(0);
+    apply_gdal_tuning(&gdal_tuning)?;
     let bounds = match bounds {
         Some(bounds) => bounds,
-        None => infer_raster_bounds(&input)?,
+        None => infer_raster_bounds(&input, &gdal_tuning)?,
     };
 
     Ok(RasterOptions {
@@ -437,6 +526,7 @@ fn parse_args(args: Vec<String>) -> io::Result<RasterOptions> {
         strategy,
         webp_quality,
         webp_method,
+        gdal_tuning,
         warp_options,
         plan_only,
     })
@@ -525,8 +615,8 @@ fn parse_bounds(value: &str) -> io::Result<[f64; 4]> {
     normalize_lonlat_bounds([parts[0], parts[1], parts[2], parts[3]], "--bounds")
 }
 
-fn infer_raster_bounds(path: &Path) -> io::Result<[f64; 4]> {
-    let dataset = gdal::Dataset::open(path).map_err(gdal_to_io)?;
+fn infer_raster_bounds(path: &Path, gdal_tuning: &GdalTuning) -> io::Result<[f64; 4]> {
+    let dataset = open_raster_dataset(path, gdal_tuning)?;
     let transform = dataset.geo_transform().map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -601,6 +691,39 @@ fn infer_raster_bounds(path: &Path) -> io::Result<[f64; 4]> {
     Ok(bounds)
 }
 
+fn apply_gdal_tuning(tuning: &GdalTuning) -> io::Result<()> {
+    if let Some(cache_bytes) = tuning.cache_bytes {
+        unsafe {
+            gdal_sys::GDALSetCacheMax64(cache_bytes as gdal_sys::GIntBig);
+        }
+        set_config_option("GDAL_CACHEMAX", &cache_bytes.to_string()).map_err(gdal_to_io)?;
+    }
+
+    for (name, value) in &tuning.config_options {
+        set_config_option(name, value).map_err(gdal_to_io)?;
+    }
+    Ok(())
+}
+
+fn open_raster_dataset(path: &Path, tuning: &GdalTuning) -> io::Result<gdal::Dataset> {
+    let open_options = tuning
+        .open_options
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>();
+    let open_option_refs = open_options.iter().map(String::as_str).collect::<Vec<_>>();
+    let options = DatasetOptions {
+        open_flags: GdalOpenFlags::GDAL_OF_RASTER | GdalOpenFlags::GDAL_OF_VERBOSE_ERROR,
+        open_options: if open_option_refs.is_empty() {
+            None
+        } else {
+            Some(&open_option_refs)
+        },
+        ..DatasetOptions::default()
+    };
+    gdal::Dataset::open_ex(path, options).map_err(gdal_to_io)
+}
+
 fn push_georef_point(
     transform: &[f64; 6],
     pixel: f64,
@@ -664,19 +787,22 @@ fn parse_workers(value: &str) -> io::Result<usize> {
     Ok(workers)
 }
 
-fn parse_chunk_tiles(value: &str) -> io::Result<Option<u32>> {
+fn parse_chunk_tiles(value: &str) -> io::Result<ChunkTiles> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(ChunkTiles::Auto);
+    }
     if matches!(value, "disabled" | "disable" | "none" | "off") {
-        return Ok(None);
+        return Ok(ChunkTiles::Disabled);
     }
     let chunk_tiles = value
         .parse()
-        .map_err(|_| invalid_input("--chunk-tiles must be an integer or disabled"))?;
+        .map_err(|_| invalid_input("--chunk-tiles must be auto, an integer, or disabled"))?;
     if chunk_tiles == 0 {
         return Err(invalid_input(
             "--chunk-tiles must be greater than zero or disabled",
         ));
     }
-    Ok(Some(chunk_tiles))
+    Ok(ChunkTiles::Fixed(chunk_tiles))
 }
 
 fn parse_memory_bytes(value: &str) -> io::Result<f64> {
@@ -701,6 +827,9 @@ fn parse_memory_bytes(value: &str) -> io::Result<f64> {
 }
 
 fn parse_warp_threads(value: &str) -> io::Result<WarpThreads> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(WarpThreads::Auto);
+    }
     if value.eq_ignore_ascii_case("all") || value.eq_ignore_ascii_case("all_cpus") {
         return Ok(WarpThreads::All);
     }
@@ -711,6 +840,17 @@ fn parse_warp_threads(value: &str) -> io::Result<WarpThreads> {
         return Err(invalid_input("--warp-threads must be greater than zero"));
     }
     Ok(WarpThreads::Count(count))
+}
+
+fn parse_gdal_disable_readdir(value: &str) -> io::Result<String> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => Ok("TRUE".to_owned()),
+        "false" | "no" | "off" => Ok("FALSE".to_owned()),
+        "empty_dir" | "empty-dir" | "empty" => Ok("EMPTY_DIR".to_owned()),
+        _ => Err(invalid_input(
+            "--gdal-disable-readdir must be true, false, or empty-dir",
+        )),
+    }
 }
 
 fn parse_resampling(value: &str) -> io::Result<Resampling> {
@@ -775,7 +915,7 @@ fn available_workers() -> usize {
         .unwrap_or(1)
 }
 
-fn print_plan(opts: &RasterOptions, jobs: &[TileJob]) {
+fn print_plan(opts: &RasterOptions, jobs: &[TileJob]) -> io::Result<()> {
     println!("Render Plan");
     print_field("Input", &opts.input.display().to_string());
     print_field("Output", &opts.output.display().to_string());
@@ -807,9 +947,21 @@ fn print_plan(opts: &RasterOptions, jobs: &[TileJob]) {
     }
     println!();
     println!("Coverage");
-    match opts.chunk_tiles {
-        Some(chunk_tiles) => print_field("Chunk tiles", &chunk_tiles.to_string()),
-        None => print_field("Chunk tiles", "disabled"),
+    print_field("Chunk tiles", &opts.chunk_tiles.label());
+    if let Some(cache_bytes) = opts.gdal_tuning.cache_bytes {
+        print_field("GDAL cache", &format_bytes(cache_bytes));
+    }
+    if !opts.gdal_tuning.open_options.is_empty() {
+        print_field(
+            "GDAL open options",
+            &format_count(opts.gdal_tuning.open_options.len() as u64),
+        );
+    }
+    if !opts.gdal_tuning.config_options.is_empty() {
+        print_field(
+            "GDAL config",
+            &format_count(opts.gdal_tuning.config_options.len() as u64),
+        );
     }
     print_field("Zooms", &format!("{}..{}", opts.min_zoom, opts.max_zoom));
     print_field(
@@ -833,11 +985,20 @@ fn print_plan(opts: &RasterOptions, jobs: &[TileJob]) {
         let count = jobs.iter().filter(|job| job.z == z).count();
         print_field(&format!("z{z}"), &format_count(count as u64));
     }
+    if opts.chunk_tiles == ChunkTiles::Auto {
+        println!();
+        println!("Auto Chunk Tiles");
+        for zoom_jobs in jobs_by_zoom(jobs) {
+            let z = zoom_jobs[0].z;
+            let chunk_tiles = auto_chunk_tiles(opts, zoom_jobs);
+            print_field(&format!("z{z}"), &chunk_tiles.to_string());
+        }
+    }
+    Ok(())
 }
 
 fn render_native(opts: &RasterOptions, jobs: &[TileJob]) -> io::Result<()> {
-    use gdal::Dataset;
-    let source = Dataset::open(&opts.input).map_err(gdal_to_io)?;
+    let source = open_raster_dataset(&opts.input, &opts.gdal_tuning)?;
     let strategy = select_render_strategy(&source, opts)?;
     eprintln!("Rendering");
     status_field("Input", &opts.input.display().to_string());
@@ -876,7 +1037,7 @@ fn render_native(opts: &RasterOptions, jobs: &[TileJob]) -> io::Result<()> {
     let mut completed = 0;
     for zoom_jobs in jobs_by_zoom(jobs) {
         let zoom = zoom_jobs[0].z;
-        let elapsed = match opts.chunk_tiles {
+        let elapsed = match chunk_tiles_for_zoom(opts, zoom_jobs) {
             Some(chunk_tiles) => {
                 render_zoom_chunked_stream(&source, opts, zoom_jobs, chunk_tiles, &mut writer)?
             }
@@ -957,6 +1118,56 @@ fn reserved_directory_bytes(tile_count: usize) -> u64 {
     estimate.clamp(MIN_RESERVED_DIRECTORY_BYTES, MAX_RESERVED_DIRECTORY_BYTES)
 }
 
+fn chunk_tiles_for_zoom(opts: &RasterOptions, zoom_jobs: &[TileJob]) -> Option<u32> {
+    match opts.chunk_tiles {
+        ChunkTiles::Disabled => None,
+        ChunkTiles::Fixed(chunk_tiles) => Some(chunk_tiles),
+        ChunkTiles::Auto => Some(auto_chunk_tiles(opts, zoom_jobs)),
+    }
+}
+
+fn auto_chunk_tiles(opts: &RasterOptions, zoom_jobs: &[TileJob]) -> u32 {
+    let tile_count = zoom_jobs.len().max(1);
+    let worker_count = opts.workers.max(1).min(tile_count);
+    let target_chunks = worker_count
+        .saturating_mul(DEFAULT_AUTO_CHUNK_TARGETS_PER_WORKER)
+        .clamp(1, tile_count);
+
+    let min_x = zoom_jobs.iter().map(|job| job.x).min().unwrap_or(0);
+    let max_x = zoom_jobs.iter().map(|job| job.x).max().unwrap_or(min_x);
+    let min_y = zoom_jobs.iter().map(|job| job.y).min().unwrap_or(0);
+    let max_y = zoom_jobs.iter().map(|job| job.y).max().unwrap_or(min_y);
+    let width_tiles = max_x - min_x + 1;
+    let height_tiles = max_y - min_y + 1;
+    let memory_budget = (opts.warp_memory_bytes.round() as usize / 2)
+        .clamp(AUTO_CHUNK_MIN_BYTES, AUTO_CHUNK_MAX_BYTES);
+
+    let mut chunk_tiles = 4_u32;
+    while chunk_count(width_tiles, height_tiles, chunk_tiles) > target_chunks {
+        let next = chunk_tiles.saturating_mul(2);
+        if next == chunk_tiles
+            || estimate_chunk_bytes_for_span(opts, next, next) > memory_budget
+            || next > width_tiles.max(height_tiles).max(1).next_power_of_two()
+        {
+            break;
+        }
+        chunk_tiles = next;
+    }
+
+    while chunk_tiles > 1
+        && estimate_chunk_bytes_for_span(opts, chunk_tiles, chunk_tiles) > memory_budget
+    {
+        chunk_tiles /= 2;
+    }
+
+    chunk_tiles.max(1)
+}
+
+fn chunk_count(width_tiles: u32, height_tiles: u32, chunk_tiles: u32) -> usize {
+    let chunk_tiles = chunk_tiles.max(1);
+    width_tiles.div_ceil(chunk_tiles) as usize * height_tiles.div_ceil(chunk_tiles) as usize
+}
+
 fn render_zoom_wide(
     source: &gdal::Dataset,
     opts: &RasterOptions,
@@ -968,7 +1179,7 @@ fn render_zoom_wide(
         &format!("Zoom z{zoom}"),
         &format!("rendering {}", format_tile_count(zoom_jobs.len())),
     );
-    let dataset = build_tile_dataset(source, opts, zoom_jobs)?;
+    let dataset = build_tile_dataset(source, opts, zoom_jobs, 1)?;
     let tiles = render_chunk_tiles_parallel(opts, dataset, zoom_jobs)?;
     Ok(RenderedZoom {
         tiles,
@@ -992,9 +1203,11 @@ fn render_zoom_chunked(
     status_field(
         &format!("Zoom z{zoom}"),
         &format!(
-            "rendering {} in {} chunks ({} workers, {}, {})",
+            "rendering {} in {} chunks of up to {}x{} tiles ({} workers, {}, {})",
             format_tile_count(zoom_jobs.len()),
             format_count(chunks.len() as u64),
+            chunk_tiles,
+            chunk_tiles,
             worker_count,
             strategy.label(),
             format_bytes((estimated_chunk_mib * 1024.0 * 1024.0).round() as u64)
@@ -1002,13 +1215,13 @@ fn render_zoom_chunked(
     );
 
     if worker_count == 1 || chunks.len() <= 1 {
-        let worker_source = gdal::Dataset::open(&opts.input).map_err(gdal_to_io)?;
+        let worker_source = open_raster_dataset(&opts.input, &opts.gdal_tuning)?;
         let mut rendered_zoom = Vec::with_capacity(zoom_jobs.len());
         let mut chunk_opts = opts.clone();
         chunk_opts.workers = 1;
         for (chunk_index, chunk_jobs) in chunks.iter().enumerate() {
             let chunk_started = std::time::Instant::now();
-            let chunk_dataset = build_tile_dataset(&worker_source, &chunk_opts, chunk_jobs)?;
+            let chunk_dataset = build_tile_dataset(&worker_source, &chunk_opts, chunk_jobs, 1)?;
             let mut rendered_chunk =
                 render_chunk_tiles_parallel(&chunk_opts, chunk_dataset, chunk_jobs)?;
             status_field(
@@ -1043,8 +1256,8 @@ fn render_zoom_chunked(
                 let chunks = &chunks;
                 scope.spawn(move || {
                     let result: Result<(), String> = (|| {
-                        let worker_source =
-                            gdal::Dataset::open(&opts.input).map_err(|err| err.to_string())?;
+                        let worker_source = open_raster_dataset(&opts.input, &opts.gdal_tuning)
+                            .map_err(|err| err.to_string())?;
                         let mut chunk_opts = opts.clone();
                         chunk_opts.workers = 1;
 
@@ -1055,9 +1268,13 @@ fn render_zoom_chunked(
                             }
                             let chunk_jobs = &chunks[chunk_index];
                             let chunk_started = std::time::Instant::now();
-                            let chunk_dataset =
-                                build_tile_dataset(&worker_source, &chunk_opts, chunk_jobs)
-                                    .map_err(|err| err.to_string())?;
+                            let chunk_dataset = build_tile_dataset(
+                                &worker_source,
+                                &chunk_opts,
+                                chunk_jobs,
+                                worker_count,
+                            )
+                            .map_err(|err| err.to_string())?;
                             let rendered_chunk =
                                 render_chunk_tiles_parallel(&chunk_opts, chunk_dataset, chunk_jobs)
                                     .map_err(|err| err.to_string())?;
@@ -1126,9 +1343,11 @@ fn render_zoom_chunked_stream(
     status_field(
         &format!("Zoom z{zoom}"),
         &format!(
-            "rendering {} in {} chunks ({} workers, {}, {})",
+            "rendering {} in {} chunks of up to {}x{} tiles ({} workers, {}, {})",
             format_tile_count(zoom_jobs.len()),
             format_count(chunks.len() as u64),
+            chunk_tiles,
+            chunk_tiles,
             worker_count,
             strategy.label(),
             format_bytes((estimated_chunk_mib * 1024.0 * 1024.0).round() as u64)
@@ -1138,16 +1357,23 @@ fn render_zoom_chunked_stream(
     let mut pending_tiles = BTreeMap::new();
     let mut next_expected = 0_usize;
     let mut completed_chunks = 0_usize;
+    let mut zoom_timing = StageTiming::default();
 
     if worker_count == 1 || chunks.len() <= 1 {
-        let worker_source = gdal::Dataset::open(&opts.input).map_err(gdal_to_io)?;
+        let worker_source = open_raster_dataset(&opts.input, &opts.gdal_tuning)?;
         let mut chunk_opts = opts.clone();
         chunk_opts.workers = 1;
         for chunk_jobs in &chunks {
             let chunk_started = std::time::Instant::now();
-            let chunk_dataset = build_tile_dataset(&worker_source, &chunk_opts, chunk_jobs)?;
-            let rendered_chunk =
-                render_chunk_tiles_parallel(&chunk_opts, chunk_dataset, chunk_jobs)?;
+            let build_started = std::time::Instant::now();
+            let chunk_dataset = build_tile_dataset(&worker_source, &chunk_opts, chunk_jobs, 1)?;
+            let mut chunk_timing = StageTiming {
+                build_dataset: build_started.elapsed().as_secs_f64(),
+                ..StageTiming::default()
+            };
+            let rendered_chunk = render_chunk_tiles_timed(&chunk_opts, &chunk_dataset, chunk_jobs)?;
+            chunk_timing.add(&rendered_chunk.timing);
+            zoom_timing.add(&chunk_timing);
             completed_chunks += 1;
             status_field(
                 &format!("Zoom z{zoom}"),
@@ -1156,16 +1382,18 @@ fn render_zoom_chunked_stream(
                     completed_chunks,
                     chunks.len(),
                     chunk_started.elapsed().as_secs_f64(),
-                    format_tile_count(rendered_chunk.len())
+                    format_tile_count(rendered_chunk.tiles.len())
                 ),
             );
+            let write_started = std::time::Instant::now();
             write_ready_tiles(
                 writer,
                 zoom_jobs,
                 &mut next_expected,
                 &mut pending_tiles,
-                rendered_chunk,
+                rendered_chunk.tiles,
             )?;
+            zoom_timing.write_tiles += write_started.elapsed().as_secs_f64();
         }
     } else {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1181,8 +1409,8 @@ fn render_zoom_chunked_stream(
                 let chunks = &chunks;
                 scope.spawn(move || {
                     let result: Result<(), String> = (|| {
-                        let worker_source =
-                            gdal::Dataset::open(&opts.input).map_err(|err| err.to_string())?;
+                        let worker_source = open_raster_dataset(&opts.input, &opts.gdal_tuning)
+                            .map_err(|err| err.to_string())?;
                         let mut chunk_opts = opts.clone();
                         chunk_opts.workers = 1;
 
@@ -1193,14 +1421,27 @@ fn render_zoom_chunked_stream(
                             }
                             let chunk_jobs = &chunks[chunk_index];
                             let chunk_started = std::time::Instant::now();
-                            let chunk_dataset =
-                                build_tile_dataset(&worker_source, &chunk_opts, chunk_jobs)
-                                    .map_err(|err| err.to_string())?;
+                            let build_started = std::time::Instant::now();
+                            let chunk_dataset = build_tile_dataset(
+                                &worker_source,
+                                &chunk_opts,
+                                chunk_jobs,
+                                worker_count,
+                            )
+                            .map_err(|err| err.to_string())?;
+                            let mut chunk_timing = StageTiming {
+                                build_dataset: build_started.elapsed().as_secs_f64(),
+                                ..StageTiming::default()
+                            };
                             let rendered_chunk =
-                                render_chunk_tiles_parallel(&chunk_opts, chunk_dataset, chunk_jobs)
+                                render_chunk_tiles_timed(&chunk_opts, &chunk_dataset, chunk_jobs)
                                     .map_err(|err| err.to_string())?;
+                            chunk_timing.add(&rendered_chunk.timing);
                             let elapsed = chunk_started.elapsed().as_secs_f64();
-                            if tx.send(Ok((rendered_chunk, elapsed))).is_err() {
+                            if tx
+                                .send(Ok((rendered_chunk.tiles, elapsed, chunk_timing)))
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -1214,7 +1455,8 @@ fn render_zoom_chunked_stream(
             drop(tx);
 
             for result in rx {
-                let (rendered_chunk, elapsed) = result.map_err(io::Error::other)?;
+                let (rendered_chunk, elapsed, chunk_timing) = result.map_err(io::Error::other)?;
+                zoom_timing.add(&chunk_timing);
                 completed_chunks += 1;
                 status_field(
                     &format!("Zoom z{zoom}"),
@@ -1226,6 +1468,7 @@ fn render_zoom_chunked_stream(
                         format_tile_count(rendered_chunk.len())
                     ),
                 );
+                let write_started = std::time::Instant::now();
                 write_ready_tiles(
                     writer,
                     zoom_jobs,
@@ -1233,6 +1476,7 @@ fn render_zoom_chunked_stream(
                     &mut pending_tiles,
                     rendered_chunk,
                 )?;
+                zoom_timing.write_tiles += write_started.elapsed().as_secs_f64();
             }
 
             Ok::<(), io::Error>(())
@@ -1247,7 +1491,19 @@ fn render_zoom_chunked_stream(
         return Err(io::Error::other("not all rendered tiles were written"));
     }
 
-    Ok(started.elapsed().as_secs_f64())
+    let elapsed = started.elapsed().as_secs_f64();
+    status_field(
+        &format!("Zoom z{zoom} stages"),
+        &format!(
+            "build/read {:.1}s, tile-read {:.1}s, encode {:.1}s, write {:.1}s (worker-sum), wall {:.1}s",
+            zoom_timing.build_dataset,
+            zoom_timing.read_tile,
+            zoom_timing.encode_tile,
+            zoom_timing.write_tiles,
+            elapsed
+        ),
+    );
+    Ok(elapsed)
 }
 
 fn write_ready_tiles(
@@ -1290,21 +1546,138 @@ fn estimate_chunk_working_set_mib(
         .max()
         .unwrap_or(0)
         + 1;
-    let width = max_chunk_width_tiles as usize * opts.tile_size as usize;
-    let height = max_chunk_height_tiles as usize * opts.tile_size as usize;
+    let bytes = estimate_chunk_bytes_for_span(opts, max_chunk_width_tiles, max_chunk_height_tiles);
+    bytes as f64 / 1024.0 / 1024.0
+}
+
+fn estimate_chunk_bytes_for_span(
+    opts: &RasterOptions,
+    width_tiles: u32,
+    height_tiles: u32,
+) -> usize {
+    let width = width_tiles as usize * opts.tile_size as usize;
+    let height = height_tiles as usize * opts.tile_size as usize;
     let assumed_bands = 4_usize;
 
     // Fast paths keep planar output plus an interleaved read buffer in memory.
-    let bytes = width
+    width
         .saturating_mul(height)
         .saturating_mul(assumed_bands)
-        .saturating_mul(2);
-    bytes as f64 / 1024.0 / 1024.0
+        .saturating_mul(2)
+}
+
+fn render_chunk_tiles_timed(
+    opts: &RasterOptions,
+    chunk_dataset: &ChunkDataset,
+    jobs: &[TileJob],
+) -> io::Result<RenderedChunk> {
+    let mut rendered = Vec::with_capacity(jobs.len());
+    let mut timing = StageTiming::default();
+    let mut scratch = TileScratch::new(opts.tile_size as usize);
+
+    for job in jobs {
+        let read_started = std::time::Instant::now();
+        let pixels = match chunk_dataset {
+            ChunkDataset::Native(chunk) => read_native_tile_pixels(opts, chunk, job)?,
+            ChunkDataset::Gdal(chunk) => read_gdal_tile_pixels(opts, chunk, job, &mut scratch)?,
+        };
+        timing.read_tile += read_started.elapsed().as_secs_f64();
+
+        let encode_started = std::time::Instant::now();
+        let data = encode_tile_gdal(opts, job, &pixels)?;
+        timing.encode_tile += encode_started.elapsed().as_secs_f64();
+        rendered.push(RenderedTile {
+            tile_id: job.tile_id,
+            data,
+        });
+    }
+
+    Ok(RenderedChunk {
+        tiles: rendered,
+        timing,
+    })
 }
 
 fn render_chunk_tiles_parallel(
     opts: &RasterOptions,
     chunk_dataset: ChunkDataset,
+    jobs: &[TileJob],
+) -> io::Result<Vec<RenderedTile>> {
+    match chunk_dataset {
+        ChunkDataset::Native(chunk) => render_native_chunk_tiles_parallel(opts, &chunk, jobs),
+        ChunkDataset::Gdal(chunk) => render_gdal_chunk_tiles_parallel(opts, chunk, jobs),
+    }
+}
+
+fn render_native_chunk_tiles_parallel(
+    opts: &RasterOptions,
+    chunk: &NativeChunk,
+    jobs: &[TileJob],
+) -> io::Result<Vec<RenderedTile>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    let worker_count = opts.workers.max(1).min(jobs.len().max(1));
+    if worker_count == 1 || jobs.len() <= 1 {
+        let mut rendered = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let pixels = read_native_tile_pixels(opts, chunk, job)?;
+            let data = encode_tile_gdal(opts, job, &pixels)?;
+            rendered.push(RenderedTile {
+                tile_id: job.tile_id,
+                data,
+            });
+        }
+        return Ok(rendered);
+    }
+
+    let next_index = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let tx = tx.clone();
+            let next_index = &next_index;
+            scope.spawn(move || {
+                loop {
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= jobs.len() {
+                        break;
+                    }
+                    let job = jobs[index];
+                    let result: Result<RenderedTile, String> = (|| {
+                        let pixels = read_native_tile_pixels(opts, chunk, &job)
+                            .map_err(|err| err.to_string())?;
+                        let data =
+                            encode_tile_gdal(opts, &job, &pixels).map_err(|err| err.to_string())?;
+                        Ok(RenderedTile {
+                            tile_id: job.tile_id,
+                            data,
+                        })
+                    })();
+                    if tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    drop(tx);
+
+    let mut rendered = Vec::with_capacity(jobs.len());
+    for result in rx {
+        rendered.push(result.map_err(io::Error::other)?);
+    }
+    if rendered.len() != jobs.len() {
+        return Err(io::Error::other("not all tile workers completed"));
+    }
+    rendered.sort_by_key(|tile| tile.tile_id);
+    Ok(rendered)
+}
+
+fn render_gdal_chunk_tiles_parallel(
+    opts: &RasterOptions,
+    chunk: GdalChunk,
     jobs: &[TileJob],
 ) -> io::Result<Vec<RenderedTile>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1315,7 +1688,7 @@ fn render_chunk_tiles_parallel(
         let mut rendered = Vec::with_capacity(jobs.len());
         let mut scratch = TileScratch::new(opts.tile_size as usize);
         for job in jobs {
-            let pixels = read_tile_pixels(opts, &chunk_dataset, job, &mut scratch)?;
+            let pixels = read_gdal_tile_pixels(opts, &chunk, job, &mut scratch)?;
             let data = encode_tile_gdal(opts, job, &pixels)?;
             rendered.push(RenderedTile {
                 tile_id: job.tile_id,
@@ -1325,14 +1698,14 @@ fn render_chunk_tiles_parallel(
         return Ok(rendered);
     }
 
-    let chunk_dataset = Arc::new(Mutex::new(chunk_dataset));
+    let chunk = Arc::new(Mutex::new(chunk));
     let next_index = AtomicUsize::new(0);
     let (tx, rx) = mpsc::channel();
 
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
             let tx = tx.clone();
-            let chunk_dataset = Arc::clone(&chunk_dataset);
+            let chunk = Arc::clone(&chunk);
             let next_index = &next_index;
             scope.spawn(move || {
                 let mut scratch = TileScratch::new(opts.tile_size as usize);
@@ -1344,10 +1717,10 @@ fn render_chunk_tiles_parallel(
                     let job = jobs[index];
                     let result: Result<RenderedTile, String> = (|| {
                         let pixels = {
-                            let chunk_dataset = chunk_dataset
+                            let chunk = chunk
                                 .lock()
                                 .map_err(|_| "chunk dataset lock poisoned".to_owned())?;
-                            read_tile_pixels(opts, &chunk_dataset, &job, &mut scratch)
+                            read_gdal_tile_pixels(opts, &chunk, &job, &mut scratch)
                                 .map_err(|err| err.to_string())?
                         };
                         let data =
@@ -1381,6 +1754,7 @@ fn build_tile_dataset(
     source: &gdal::Dataset,
     opts: &RasterOptions,
     jobs: &[TileJob],
+    concurrent_warps: usize,
 ) -> io::Result<ChunkDataset> {
     use gdal::DriverManager;
     use gdal::spatial_ref::SpatialRef;
@@ -1427,7 +1801,7 @@ fn build_tile_dataset(
     let dst_srs = SpatialRef::from_epsg(3857).map_err(gdal_to_io)?;
     dataset.set_spatial_ref(&dst_srs).map_err(gdal_to_io)?;
 
-    reproject_with_options(source, &dataset, opts)?;
+    reproject_with_options(source, &dataset, opts, concurrent_warps)?;
 
     Ok(ChunkDataset::Gdal(GdalChunk {
         dataset,
@@ -1573,38 +1947,44 @@ fn build_same_crs_webmercator_dataset(
                 let mut interleaved = vec![0_u8; dst_width * dst_height * band_count];
                 read_interleaved_window_resampled(
                     source,
-                    src_xoff,
-                    src_yoff,
-                    src_xsize,
-                    src_ysize,
-                    dst_width,
-                    dst_height,
-                    band_count,
+                    ResampledReadWindow {
+                        src_xoff,
+                        src_yoff,
+                        src_xsize,
+                        src_ysize,
+                        dst_width,
+                        dst_height,
+                        band_count,
+                        resampling: opts.resampling,
+                    },
                     &mut band_map,
-                    opts.resampling,
                     &mut interleaved,
                 )?;
 
                 copy_interleaved_window(
                     &interleaved,
-                    dst_width,
-                    dst_height,
                     &mut pixels,
-                    width,
-                    dst_xoff,
-                    dst_yoff,
-                    band_count,
+                    InterleavedWindow {
+                        width: dst_width,
+                        height: dst_height,
+                        band_count,
+                    },
+                    DestinationWindow {
+                        width,
+                        x: dst_xoff,
+                        y: dst_yoff,
+                    },
                 );
             }
         }
 
-        return Ok(Some(ChunkDataset::Native(NativeChunk {
+        Ok(Some(ChunkDataset::Native(NativeChunk {
             pixels,
             width,
             min_x,
             min_y,
             band_count,
-        })));
+        })))
     }
 }
 
@@ -1662,9 +2042,21 @@ fn build_fast_geographic_dataset(
         let src_x = (lon - transform[0]) / transform[1] - 0.5;
         x_samples.push(sample_indices(src_x, source_width, opts.resampling));
     }
+    let source_xoff = x_samples
+        .iter()
+        .map(|sample| sample.lower)
+        .min()
+        .unwrap_or(0);
+    let source_xend = x_samples
+        .iter()
+        .map(|sample| sample.upper)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let source_window_width = source_xend.saturating_sub(source_xoff).max(1);
 
     let mut pixels = vec![0_u8; width * height * band_count];
-    let row_len = source_width * band_count;
+    let row_len = source_window_width * band_count;
     let mut row_a = vec![0_u8; row_len];
     let mut row_b = vec![0_u8; row_len];
     let mut cached_a = None;
@@ -1679,8 +2071,9 @@ fn build_fast_geographic_dataset(
         if cached_a != Some(y_sample.lower) {
             read_interleaved_row(
                 source,
+                source_xoff,
                 y_sample.lower,
-                source_width,
+                source_window_width,
                 band_count,
                 &mut band_map,
                 &mut row_a,
@@ -1693,8 +2086,9 @@ fn build_fast_geographic_dataset(
             } else {
                 read_interleaved_row(
                     source,
+                    source_xoff,
                     y_sample.upper,
-                    source_width,
+                    source_window_width,
                     band_count,
                     &mut band_map,
                     &mut row_b,
@@ -1705,11 +2099,13 @@ fn build_fast_geographic_dataset(
 
         for (x, x_sample) in x_samples.iter().enumerate() {
             let out_offset = (y * width + x) * band_count;
+            let lower = x_sample.lower - source_xoff;
+            let upper = x_sample.upper - source_xoff;
             for band_offset in 0..band_count {
-                let top_left = row_a[x_sample.lower * band_count + band_offset] as f64;
-                let top_right = row_a[x_sample.upper * band_count + band_offset] as f64;
-                let bottom_left = row_b[x_sample.lower * band_count + band_offset] as f64;
-                let bottom_right = row_b[x_sample.upper * band_count + band_offset] as f64;
+                let top_left = row_a[lower * band_count + band_offset] as f64;
+                let top_right = row_a[upper * band_count + band_offset] as f64;
+                let bottom_left = row_b[lower * band_count + band_offset] as f64;
+                let bottom_right = row_b[upper * band_count + band_offset] as f64;
                 let top_value = top_left + (top_right - top_left) * x_sample.weight;
                 let bottom_value = bottom_left + (bottom_right - bottom_left) * x_sample.weight;
                 pixels[out_offset + band_offset] =
@@ -1727,21 +2123,30 @@ fn build_fast_geographic_dataset(
     })))
 }
 
+struct InterleavedWindow {
+    width: usize,
+    height: usize,
+    band_count: usize,
+}
+
+struct DestinationWindow {
+    width: usize,
+    x: usize,
+    y: usize,
+}
+
 fn copy_interleaved_window(
     source: &[u8],
-    source_width: usize,
-    source_height: usize,
     destination: &mut [u8],
-    destination_width: usize,
-    destination_x: usize,
-    destination_y: usize,
-    band_count: usize,
+    source_window: InterleavedWindow,
+    destination_window: DestinationWindow,
 ) {
-    let row_bytes = source_width * band_count;
-    for y in 0..source_height {
+    let row_bytes = source_window.width * source_window.band_count;
+    for y in 0..source_window.height {
         let source_start = y * row_bytes;
-        let destination_start =
-            ((destination_y + y) * destination_width + destination_x) * band_count;
+        let destination_start = ((destination_window.y + y) * destination_window.width
+            + destination_window.x)
+            * source_window.band_count;
         destination[destination_start..destination_start + row_bytes]
             .copy_from_slice(&source[source_start..source_start + row_bytes]);
     }
@@ -1790,13 +2195,14 @@ fn mercator_y_to_lat(merc_y: f64) -> f64 {
 
 fn read_interleaved_row(
     source: &gdal::Dataset,
+    x: usize,
     y: usize,
     width: usize,
     band_count: usize,
     band_map: &mut [i32],
     buffer: &mut [u8],
 ) -> io::Result<()> {
-    read_interleaved_row_window(source, 0, y, width, band_count, band_map, buffer)
+    read_interleaved_row_window(source, x, y, width, band_count, band_map, buffer)
 }
 
 fn read_interleaved_row_window(
@@ -1845,8 +2251,7 @@ fn read_interleaved_row_window(
     Ok(())
 }
 
-fn read_interleaved_window_resampled(
-    source: &gdal::Dataset,
+struct ResampledReadWindow {
     src_xoff: f64,
     src_yoff: f64,
     src_xsize: f64,
@@ -1854,11 +2259,16 @@ fn read_interleaved_window_resampled(
     dst_width: usize,
     dst_height: usize,
     band_count: usize,
-    band_map: &mut [i32],
     resampling: Resampling,
+}
+
+fn read_interleaved_window_resampled(
+    source: &gdal::Dataset,
+    window: ResampledReadWindow,
+    band_map: &mut [i32],
     buffer: &mut [u8],
 ) -> io::Result<()> {
-    let rio_resampling = match resampling {
+    let rio_resampling = match window.resampling {
         Resampling::Nearest => gdal_sys::GDALRIOResampleAlg::GRIORA_NearestNeighbour,
         _ => gdal_sys::GDALRIOResampleAlg::GRIORA_Bilinear,
     };
@@ -1868,15 +2278,15 @@ fn read_interleaved_window_resampled(
         pfnProgress: None,
         pProgressData: std::ptr::null_mut(),
         bFloatingPointWindowValidity: 1,
-        dfXOff: src_xoff,
-        dfYOff: src_yoff,
-        dfXSize: src_xsize,
-        dfYSize: src_ysize,
+        dfXOff: window.src_xoff,
+        dfYOff: window.src_yoff,
+        dfXSize: window.src_xsize,
+        dfYSize: window.src_ysize,
     };
-    let int_xoff = src_xoff.floor().max(0.0) as i32;
-    let int_yoff = src_yoff.floor().max(0.0) as i32;
-    let int_xsize = src_xsize.ceil().max(1.0) as i32;
-    let int_ysize = src_ysize.ceil().max(1.0) as i32;
+    let int_xoff = window.src_xoff.floor().max(0.0) as i32;
+    let int_yoff = window.src_yoff.floor().max(0.0) as i32;
+    let int_xsize = window.src_xsize.ceil().max(1.0) as i32;
+    let int_ysize = window.src_ysize.ceil().max(1.0) as i32;
     let result = unsafe {
         gdal_sys::GDALDatasetRasterIOEx(
             source.c_dataset(),
@@ -1886,21 +2296,25 @@ fn read_interleaved_window_resampled(
             int_xsize,
             int_ysize,
             buffer.as_mut_ptr() as *mut std::ffi::c_void,
-            dst_width
+            window
+                .dst_width
                 .try_into()
                 .map_err(|_| invalid_input("destination width exceeds GDAL int range"))?,
-            dst_height
+            window
+                .dst_height
                 .try_into()
                 .map_err(|_| invalid_input("destination height exceeds GDAL int range"))?,
             gdal_sys::GDALDataType::GDT_Byte,
-            band_count
+            window
+                .band_count
                 .try_into()
                 .map_err(|_| invalid_input("band count exceeds GDAL int range"))?,
             band_map.as_mut_ptr(),
-            band_count
+            window
+                .band_count
                 .try_into()
                 .map_err(|_| invalid_input("pixel stride exceeds GDAL range"))?,
-            (dst_width * band_count)
+            (window.dst_width * window.band_count)
                 .try_into()
                 .map_err(|_| invalid_input("line stride exceeds GDAL range"))?,
             1,
@@ -1917,10 +2331,14 @@ fn reproject_with_options(
     source: &gdal::Dataset,
     destination: &gdal::Dataset,
     opts: &RasterOptions,
+    concurrent_warps: usize,
 ) -> io::Result<()> {
     let mut warp_options = CslStringList::new();
     warp_options
-        .set_name_value("NUM_THREADS", &opts.warp_threads.as_gdal_value())
+        .set_name_value(
+            "NUM_THREADS",
+            &opts.warp_threads.as_gdal_value(concurrent_warps),
+        )
         .map_err(gdal_to_io)?;
     warp_options
         .set_name_value("SKIP_NOSOURCE", "YES")
@@ -1937,7 +2355,7 @@ fn reproject_with_options(
     }
 
     unsafe {
-        (*raw_options).papszWarpOptions = warp_options.into_ptr() as *mut *mut std::ffi::c_char;
+        (*raw_options).papszWarpOptions = warp_options.into_ptr();
     }
 
     let result = unsafe {
@@ -1980,57 +2398,61 @@ fn last_gdal_error_message() -> String {
     }
 }
 
-fn read_tile_pixels<'a>(
+fn read_native_tile_pixels<'a>(
     opts: &RasterOptions,
-    chunk_dataset: &ChunkDataset,
+    chunk: &'a NativeChunk,
+    job: &TileJob,
+) -> io::Result<TilePixels<'a>> {
+    let tile_size = opts.tile_size as usize;
+    let xoff = ((job.x - chunk.min_x) * opts.tile_size) as usize;
+    let yoff = ((job.y - chunk.min_y) * opts.tile_size) as usize;
+    let row_stride = chunk.width * chunk.band_count;
+    let row_bytes = tile_size * chunk.band_count;
+    let start = (yoff * chunk.width + xoff) * chunk.band_count;
+    let length = (tile_size - 1)
+        .saturating_mul(row_stride)
+        .saturating_add(row_bytes);
+    let end = start.saturating_add(length);
+    if end > chunk.pixels.len() {
+        return Err(io::Error::other("native chunk tile view is out of bounds"));
+    }
+    Ok(TilePixels {
+        tile_size,
+        band_count: chunk.band_count,
+        row_stride,
+        pixels: &chunk.pixels[start..end],
+    })
+}
+
+fn read_gdal_tile_pixels<'a>(
+    opts: &RasterOptions,
+    chunk: &GdalChunk,
     job: &TileJob,
     scratch: &'a mut TileScratch,
 ) -> io::Result<TilePixels<'a>> {
     let tile_size = opts.tile_size as usize;
-    match chunk_dataset {
-        ChunkDataset::Native(chunk) => {
-            let xoff = ((job.x - chunk.min_x) * opts.tile_size) as usize;
-            let yoff = ((job.y - chunk.min_y) * opts.tile_size) as usize;
-            scratch
-                .pixels
-                .resize(tile_size * tile_size * chunk.band_count, 0);
-            let row_bytes = tile_size * chunk.band_count;
-            for y in 0..tile_size {
-                let source_start = ((yoff + y) * chunk.width + xoff) * chunk.band_count;
-                let target_start = y * row_bytes;
-                scratch.pixels[target_start..target_start + row_bytes]
-                    .copy_from_slice(&chunk.pixels[source_start..source_start + row_bytes]);
-            }
-            Ok(TilePixels {
-                tile_size,
-                band_count: chunk.band_count,
-                pixels: &scratch.pixels,
-            })
-        }
-        ChunkDataset::Gdal(chunk) => {
-            let xoff = ((job.x - chunk.min_x) * opts.tile_size) as isize;
-            let yoff = ((job.y - chunk.min_y) * opts.tile_size) as isize;
-            scratch.bands.clear();
-            for band_index in 1..=chunk.band_count {
-                let source_band = chunk.dataset.rasterband(band_index).map_err(gdal_to_io)?;
-                let data = source_band
-                    .read_as::<u8>(
-                        (xoff, yoff),
-                        (tile_size, tile_size),
-                        (tile_size, tile_size),
-                        None,
-                    )
-                    .map_err(gdal_to_io)?;
-                scratch.bands.push(data.data().to_vec());
-            }
-            interleave_bands_into(&scratch.bands, tile_size * tile_size, &mut scratch.pixels);
-            Ok(TilePixels {
-                tile_size,
-                band_count: chunk.band_count,
-                pixels: &scratch.pixels,
-            })
-        }
+    let xoff = ((job.x - chunk.min_x) * opts.tile_size) as isize;
+    let yoff = ((job.y - chunk.min_y) * opts.tile_size) as isize;
+    scratch.bands.clear();
+    for band_index in 1..=chunk.band_count {
+        let source_band = chunk.dataset.rasterband(band_index).map_err(gdal_to_io)?;
+        let data = source_band
+            .read_as::<u8>(
+                (xoff, yoff),
+                (tile_size, tile_size),
+                (tile_size, tile_size),
+                None,
+            )
+            .map_err(gdal_to_io)?;
+        scratch.bands.push(data.data().to_vec());
     }
+    interleave_bands_into(&scratch.bands, tile_size * tile_size, &mut scratch.pixels);
+    Ok(TilePixels {
+        tile_size,
+        band_count: chunk.band_count,
+        row_stride: tile_size * chunk.band_count,
+        pixels: &scratch.pixels,
+    })
 }
 
 fn encode_tile_gdal(
@@ -2052,7 +2474,7 @@ fn encode_tile_gdal(
 
     for band_offset in 0..pixels.band_count {
         let band_index = band_offset + 1;
-        let band_data = deinterleave_band(pixels.pixels, pixels.band_count, band_offset);
+        let band_data = deinterleave_band(pixels, band_offset);
         let mut data = Buffer::new((pixels.tile_size, pixels.tile_size), band_data);
         let mut target_band = tile_ds.rasterband(band_index).map_err(gdal_to_io)?;
         target_band
@@ -2093,7 +2515,7 @@ fn encode_tile_webp(opts: &RasterOptions, pixels: &TilePixels<'_>) -> io::Result
         .map_err(|_| invalid_input("tile width exceeds libwebp int range"))?;
     let height = i32::try_from(pixels.tile_size)
         .map_err(|_| invalid_input("tile height exceeds libwebp int range"))?;
-    let stride = i32::try_from(pixels.tile_size * pixels.band_count)
+    let stride = i32::try_from(pixels.row_stride)
         .map_err(|_| invalid_input("tile stride exceeds libwebp int range"))?;
 
     let mut config = std::mem::MaybeUninit::<WebPConfig>::uninit();
@@ -2171,11 +2593,18 @@ fn interleave_bands_into(bands: &[Vec<u8>], pixel_count: usize, pixels: &mut Vec
     }
 }
 
-fn deinterleave_band(pixels: &[u8], band_count: usize, band_offset: usize) -> Vec<u8> {
-    pixels
-        .chunks_exact(band_count)
-        .map(|pixel| pixel[band_offset])
-        .collect()
+fn deinterleave_band(pixels: &TilePixels<'_>, band_offset: usize) -> Vec<u8> {
+    let mut band = Vec::with_capacity(pixels.tile_size * pixels.tile_size);
+    let row_bytes = pixels.tile_size * pixels.band_count;
+    for y in 0..pixels.tile_size {
+        let row_start = y * pixels.row_stride;
+        let row = &pixels.pixels[row_start..row_start + row_bytes];
+        band.extend(
+            row.chunks_exact(pixels.band_count)
+                .map(|pixel| pixel[band_offset]),
+        );
+    }
+    band
 }
 
 struct RenderedTile {
@@ -2183,9 +2612,31 @@ struct RenderedTile {
     data: Vec<u8>,
 }
 
+struct RenderedChunk {
+    tiles: Vec<RenderedTile>,
+    timing: StageTiming,
+}
+
 struct RenderedZoom {
     tiles: Vec<RenderedTile>,
     elapsed: f64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct StageTiming {
+    build_dataset: f64,
+    read_tile: f64,
+    encode_tile: f64,
+    write_tiles: f64,
+}
+
+impl StageTiming {
+    fn add(&mut self, other: &Self) {
+        self.build_dataset += other.build_dataset;
+        self.read_tile += other.read_tile;
+        self.encode_tile += other.encode_tile;
+        self.write_tiles += other.write_tiles;
+    }
 }
 
 struct TileScratch {
@@ -2205,6 +2656,7 @@ impl TileScratch {
 struct TilePixels<'a> {
     tile_size: usize,
     band_count: usize,
+    row_stride: usize,
     pixels: &'a [u8],
 }
 
@@ -2383,14 +2835,21 @@ Options:
   --format <fmt>         png, jpeg, jpg, or webp [default: webp]
   --tile-size <px>       Output tile size [default: 512]
   --workers <n>          Native render workers [default: host parallelism]
-  --chunk-tiles <n|off>  Chunk width/height in tiles, or disabled/off [default: 8]
+  --chunk-tiles <auto|n|off>
+                         Chunk width/height in tiles, adaptive, or disabled/off [default: auto]
   --quality <0-100>      JPEG/WebP quality [default: 100]
   --webp-method <0-6>    WebP speed/size tradeoff, 0 fastest, 6 smallest [default: 4]
   --warp-memory <size>   GDAL warp memory, suffix K/M/G allowed [default: 512M]
-  --warp-threads <n|all> GDAL warp compute threads [default: all]
+  --warp-threads <auto|n|all>
+                         GDAL warp compute threads [default: auto]
   --resampling <method>  nearest, bilinear, cubic, cubicspline, lanczos, average [default: bilinear]
   --strategy <strategy>  auto, same-crs, geographic, or gdal-warp [default: auto]
   --warp-option <K=V>    Extra GDAL warp option, repeatable
+  --gdal-cache <size>    GDAL block cache size, suffix K/M/G allowed
+  --gdal-config <K=V>    GDAL config option set before opening inputs, repeatable
+  --open-option <K=V>    GDAL dataset open option, repeatable
+  --gdal-disable-readdir <true|false|empty-dir>
+                         Set GDAL_DISABLE_READDIR_ON_OPEN
   -h, --help             Show help
 "
     );
@@ -2464,6 +2923,67 @@ mod tests {
             parse_strategy("gdal-warp").unwrap(),
             StrategyPreference::GdalWarp
         );
+    }
+
+    #[test]
+    fn chunk_parser_accepts_auto_fixed_and_disabled() {
+        assert_eq!(parse_chunk_tiles("auto").unwrap(), ChunkTiles::Auto);
+        assert_eq!(parse_chunk_tiles("4").unwrap(), ChunkTiles::Fixed(4));
+        assert_eq!(parse_chunk_tiles("off").unwrap(), ChunkTiles::Disabled);
+    }
+
+    #[test]
+    fn auto_chunking_keeps_parallel_chunks_for_world_zoom_five() {
+        let jobs =
+            enumerate_tile_jobs([-180.0, -85.051_128_78, 180.0, 85.051_128_78], 5, 5).unwrap();
+        let opts = RasterOptions {
+            input: PathBuf::from("input.tif"),
+            output: PathBuf::from("output.pmtiles"),
+            min_zoom: 5,
+            max_zoom: 5,
+            bounds: [-180.0, -85.051_128_78, 180.0, 85.051_128_78],
+            format: RasterFormat::Webp,
+            tile_size: 512,
+            workers: 8,
+            chunk_tiles: ChunkTiles::Auto,
+            warp_memory_bytes: 512.0 * 1024.0 * 1024.0,
+            warp_threads: WarpThreads::Auto,
+            resampling: Resampling::Bilinear,
+            strategy: StrategyPreference::Auto,
+            webp_quality: DEFAULT_WEBP_QUALITY,
+            webp_method: DEFAULT_WEBP_METHOD,
+            gdal_tuning: GdalTuning::default(),
+            warp_options: Vec::new(),
+            plan_only: false,
+        };
+        assert_eq!(auto_chunk_tiles(&opts, &jobs), 4);
+    }
+
+    #[test]
+    fn auto_chunking_avoids_tiny_low_zoom_chunks() {
+        let jobs =
+            enumerate_tile_jobs([-180.0, -85.051_128_78, 180.0, 85.051_128_78], 2, 2).unwrap();
+        let opts = RasterOptions {
+            input: PathBuf::from("input.tif"),
+            output: PathBuf::from("output.pmtiles"),
+            min_zoom: 2,
+            max_zoom: 2,
+            bounds: [-180.0, -85.051_128_78, 180.0, 85.051_128_78],
+            format: RasterFormat::Webp,
+            tile_size: 512,
+            workers: 8,
+            chunk_tiles: ChunkTiles::Auto,
+            warp_memory_bytes: 512.0 * 1024.0 * 1024.0,
+            warp_threads: WarpThreads::Auto,
+            resampling: Resampling::Bilinear,
+            strategy: StrategyPreference::Auto,
+            webp_quality: DEFAULT_WEBP_QUALITY,
+            webp_method: DEFAULT_WEBP_METHOD,
+            gdal_tuning: GdalTuning::default(),
+            warp_options: Vec::new(),
+            plan_only: false,
+        };
+        assert_eq!(auto_chunk_tiles(&opts, &jobs), 4);
     }
 
     #[test]

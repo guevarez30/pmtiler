@@ -148,14 +148,21 @@ Raster options:
 --format <fmt>         png, jpeg, jpg, or webp [default: webp]
 --tile-size <px>       Output tile size [default: 512]
 --workers <n>          Native render workers [default: host parallelism]
---chunk-tiles <n|off>  Chunk width/height in tiles, or disabled/off [default: 8]
+--chunk-tiles <auto|n|off>
+                       Chunk width/height in tiles, adaptive, or disabled/off [default: auto]
 --quality <0-100>      JPEG/WebP quality [default: 100]
 --webp-method <0-6>    WebP speed/size tradeoff, 0 fastest, 6 smallest [default: 4]
 --warp-memory <size>   GDAL warp memory, suffix K/M/G allowed [default: 512M]
---warp-threads <n|all> GDAL warp compute threads [default: all]
+--warp-threads <auto|n|all>
+                       GDAL warp compute threads [default: auto]
 --resampling <method>  nearest, bilinear, cubic, cubicspline, lanczos, average [default: bilinear]
 --strategy <strategy>  auto, same-crs, geographic, or gdal-warp [default: auto]
 --warp-option <K=V>    Extra GDAL warp option, repeatable
+--gdal-cache <size>    GDAL block cache size, suffix K/M/G allowed
+--gdal-config <K=V>    GDAL config option set before opening inputs, repeatable
+--open-option <K=V>    GDAL dataset open option, repeatable
+--gdal-disable-readdir <true|false|empty-dir>
+                       Set GDAL_DISABLE_READDIR_ON_OPEN
 ```
 
 ## Performance Example
@@ -187,6 +194,17 @@ Output format:     WebP, 512px tiles
 ```
 
 More benchmark details are in [BENCHMARK.md](BENCHMARK.md).
+
+A larger aerial imagery run using a 12 GB NOAA NAIP VRT is documented in
+[docs/large-raster-example.md](docs/large-raster-example.md).
+
+Run the local benchmark and byte-identical quality check against the bundled
+Blue Marble fixture:
+
+```bash
+tools/benchmark-blue-marble.sh
+tools/quality-blue-marble.sh
+```
 
 ## Build A VRT From TIFFs
 
@@ -247,6 +265,9 @@ For server setup, follow the PMTiles server guidance in the Protomaps PMTiles
 project: [github.com/protomaps/pmtiles](https://github.com/protomaps/pmtiles).
 Credit to Protomaps for the PMTiles format and server tooling that make this
 deployment path straightforward.
+
+More serving notes, including static hosting and XYZ tile endpoint guidance, are
+in [docs/serving.md](docs/serving.md).
 
 Example:
 

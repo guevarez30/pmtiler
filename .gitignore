@@ -1,3 +1,16 @@
-/target
-/datasets
+/target/
+
+# Local raster inputs and generated archives can be very large.
+/datasets/
+*.pmtiles
+*.tif
+*.tiff
+*.vrt
+
+# Local/editor noise.
+.DS_Store
+*.swp
+*.swo
+.env
+.env.*
 .bookmarks
