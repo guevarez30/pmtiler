@@ -193,19 +193,6 @@ Elapsed time:      1514.7 seconds
 Output format:     WebP, 512px tiles
 ```
 
-More benchmark details are in [BENCHMARK.md](BENCHMARK.md).
-
-A larger aerial imagery run using a 12 GB NOAA NAIP VRT is documented in
-[docs/large-raster-example.md](docs/large-raster-example.md).
-
-Run the local benchmark and byte-identical quality check against the bundled
-Blue Marble fixture:
-
-```bash
-tools/benchmark-blue-marble.sh
-tools/quality-blue-marble.sh
-```
-
 ## Build A VRT From TIFFs
 
 For a directory of GeoTIFFs, build a VRT first and pass the VRT to `pmtiler`.
@@ -266,18 +253,6 @@ project: [github.com/protomaps/pmtiles](https://github.com/protomaps/pmtiles).
 Credit to Protomaps for the PMTiles format and server tooling that make this
 deployment path straightforward.
 
-More serving notes, including static hosting and XYZ tile endpoint guidance, are
-in [docs/serving.md](docs/serving.md).
-
-Example:
-
-```bash
-pmtiler raster mosaic.vrt /srv/pmtiles/conus.pmtiles \
-  --zoom 0-13 \
-  --bounds=-125,24,-66,50 \
-  --format webp \
-  --tile-size 512
-```
 
 ## Credits
 
